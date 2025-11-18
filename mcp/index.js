@@ -1408,6 +1408,50 @@ function resolveModuleAlias(db, moduleName) {
 }
 
 // ============================================================================
+// Namespace Mapping Helper
+// ============================================================================
+
+/**
+ * Convert qualified name (internal format) to code access path (user-facing format)
+ * Examples:
+ *   "Global-WebAPI" -> "WebAPI.Global"
+ *   "DOMAPI-WebAPI" -> "WebAPI.DOMAPI"
+ *   "React.Children" -> "React.Children" (nested modules, no namespace)
+ *   "Stdlib_Array" -> "Array" (if aliased) or "Stdlib_Array" (if not)
+ */
+function qualifiedNameToCodePath(qualifiedName) {
+  if (!qualifiedName) return qualifiedName;
+
+  // Check if it contains namespace separator (ModuleName-Namespace)
+  const namespaceMatch = qualifiedName.match(
+    /^([A-Za-z_][A-Za-z0-9_]*)-([A-Za-z_][A-Za-z0-9_.]*)$/,
+  );
+  if (namespaceMatch) {
+    const [, moduleName, namespace] = namespaceMatch;
+    // Convert to code access path: Namespace.ModuleName
+    // Handle nested namespaces (e.g., "Module-SubNamespace.Namespace" -> "SubNamespace.Namespace.Module")
+    const namespaceParts = namespace.split(".");
+    namespaceParts.push(moduleName);
+    return namespaceParts.join(".");
+  }
+
+  // No namespace, return as-is (could be nested module like "React.Children")
+  return qualifiedName;
+}
+
+/**
+ * Get both qualified name and code access path for a module
+ */
+function getModulePaths(qualifiedName) {
+  const codePath = qualifiedNameToCodePath(qualifiedName);
+  return {
+    qualifiedName, // Internal format (e.g., "Global-WebAPI")
+    codePath, // Code access path (e.g., "WebAPI.Global")
+    ...(qualifiedName !== codePath && { hasNamespace: true }),
+  };
+}
+
+// ============================================================================
 // Core Lookup Functions
 // ============================================================================
 
@@ -1513,6 +1557,9 @@ async function getTypeDetails(db, qualifiedModuleName, typeName) {
     usageHint = `Pattern match with: ${constructors}`;
   }
 
+  // Get module paths (qualified name and code access path)
+  const modulePaths = getModulePaths(resolvedModule.qualified_name);
+
   const typeResult = {
     name: type.name,
     kind: type.kind || "unknown",
@@ -1521,6 +1568,10 @@ async function getTypeDetails(db, qualifiedModuleName, typeName) {
     genericParameters: genericParameters,
     typeReferences: typeReferences,
     usageHint: usageHint,
+    module: {
+      qualifiedName: resolvedModule.qualified_name,
+      ...modulePaths,
+    },
     ...(resolvedFromAlias && { resolvedFromAlias }),
   };
 
@@ -1585,12 +1636,19 @@ async function getValueDetails(db, qualifiedModuleName, valueName) {
     };
   }
 
+  // Get module paths (qualified name and code access path)
+  const modulePaths = getModulePaths(resolvedModule.qualified_name);
+
   const valueResult = {
     name: value.name,
     signature: value.signature,
     paramCount: value.param_count,
     returnType: value.return_type,
     detail: JSON.parse(value.detail),
+    module: {
+      qualifiedName: resolvedModule.qualified_name,
+      ...modulePaths,
+    },
     ...(resolvedFromAlias && { resolvedFromAlias }),
   };
 
@@ -1688,13 +1746,15 @@ async function searchCodebase(
         mod.qualified_name,
         searchTermLower,
       );
+      const modulePaths = getModulePaths(mod.qualified_name);
       results.push({
         category: "module",
         name: mod.qualified_name,
         qualifiedName: mod.qualified_name,
+        codePath: modulePaths.codePath,
         packageName: mod.package_name,
         signature: undefined,
-        description: `Module: ${mod.qualified_name}`,
+        description: `Module: ${mod.qualified_name}${modulePaths.hasNamespace ? ` (access as: ${modulePaths.codePath})` : ""}`,
         matchScore: matchScore,
         categoryPriority: getCategoryPriority("module"),
       });
@@ -1718,13 +1778,15 @@ async function searchCodebase(
 
     for (const type of types) {
       const matchScore = calculateMatchScore(type.name, searchTermLower);
+      const modulePaths = getModulePaths(type.module_name);
       results.push({
         category: "type",
         name: type.name,
         qualifiedName: `${type.module_name}.${type.name}`,
+        codePath: `${modulePaths.codePath}.${type.name}`,
         packageName: type.package_name,
         signature: type.signature,
-        description: `${type.kind || "type"}: ${type.name}`,
+        description: `${type.kind || "type"}: ${type.name}${modulePaths.hasNamespace ? ` (access as: ${modulePaths.codePath}.${type.name})` : ""}`,
         matchScore: matchScore,
         categoryPriority: getCategoryPriority("type"),
       });
@@ -1748,13 +1810,15 @@ async function searchCodebase(
 
     for (const value of values) {
       const matchScore = calculateMatchScore(value.name, searchTermLower);
+      const modulePaths = getModulePaths(value.module_name);
       results.push({
         category: "value",
         name: value.name,
         qualifiedName: `${value.module_name}.${value.name}`,
+        codePath: `${modulePaths.codePath}.${value.name}`,
         packageName: value.package_name,
         signature: value.signature,
-        description: `Function (${value.param_count} params): ${value.name}`,
+        description: `Function (${value.param_count} params): ${value.name}${modulePaths.hasNamespace ? ` (access as: ${modulePaths.codePath}.${value.name})` : ""}`,
         matchScore: matchScore,
         categoryPriority: getCategoryPriority("value"),
       });
@@ -1799,6 +1863,7 @@ async function searchCodebase(
       category: r.category,
       name: r.name,
       qualifiedName: r.qualifiedName,
+      codePath: r.codePath,
       packageName: r.packageName,
       signature: r.signature,
       description: r.description,
@@ -1821,7 +1886,18 @@ const server = new McpServer({
   name: "ReScript Project Assistant",
   version: "1.0.0",
   description:
-    "Provides accurate ReScript module, type, and value information from indexed projects. Indexes compiled ReScript code and stores it in SQLite for fast querying. Supports namespaced modules (e.g., 'DOMAPI-WebAPI'), nested modules (e.g., 'React.Children'), multiple lookups in single calls, global types/values, and provides comprehensive documentation for types and values.\n\nIMPORTANT: Use MCP tools for function signatures, type definitions, and module exploration. Use traditional grep/search for code patterns, usage examples, and implementation details. MCP tools excel at finding declared symbols but cannot find code patterns or usage examples.",
+    "Provides accurate ReScript module, type, and value information from indexed projects. Indexes compiled ReScript code and stores it in SQLite for fast querying. Supports namespaced modules (e.g., 'DOMAPI-WebAPI'), nested modules (e.g., 'React.Children'), multiple lookups in single calls, global types/values, and provides comprehensive documentation for types and values.\n\n" +
+    "WHAT IT CAN DO:\n" +
+    "- API exploration: Discover available functions, types, and modules\n" +
+    "- Signature discovery: Get exact function signatures, parameter counts, and return types\n" +
+    "- Type definitions: Understand type structures and variants\n" +
+    "- Module hierarchy: Explore module relationships and qualified names\n" +
+    "- Namespace mapping: Convert qualified names to code access paths\n\n" +
+    "WHAT IT CANNOT DO:\n" +
+    "- Code examples: Does not provide actual code implementations or usage examples from your codebase\n" +
+    "- Usage patterns: Does not show how functions are typically used together in practice\n" +
+    "- Implementation details: Cannot find actual code implementations or usage in your codebase\n\n" +
+    "IMPORTANT: Use MCP tools for function signatures, type definitions, and module exploration. Use traditional grep/search for code patterns, usage examples, and implementation details.",
   capabilities: {
     resources: {},
     tools: {},
@@ -1938,6 +2014,16 @@ server.registerTool(
     description: `Execute a raw SQL SELECT query against the ReScript database. Only SELECT queries are allowed for security. The database schema is documented in rescript-db-schema.mdc.
 
 Use this tool to query packages, modules, types, values, aliases, type references, and generic parameters. See rescript-db-schema.mdc for the complete schema and example queries.
+
+WHAT IT CAN DO:
+- Query database schema: Access packages, modules, types, values, aliases, type references, and generic parameters
+- Complex queries: Join tables to find relationships between symbols
+- Filter and search: Use SQL WHERE clauses to filter results
+
+WHAT IT CANNOT DO:
+- Code examples: Does not return actual code implementations
+- Usage patterns: Cannot show how symbols are used in your codebase
+- Pattern matching: Use grep/search for finding code patterns
 
 Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds.`,
     inputSchema: {
