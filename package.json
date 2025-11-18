@@ -13,9 +13,11 @@
     "mcp"
   ],
   "devDependencies": {
-    "prettier": "^3.6.2"
+    "prettier": "^3.6.2",
+    "@modelcontextprotocol/inspector": "^1.0.0"
   },
   "scripts": {
-    "fmt": "prettier --write ./mcp ./README.md"
+    "fmt": "prettier --write ./mcp ./README.md",
+    "start": "bunx @modelcontextprotocol/inspector bun mcp/index.js --stdio"
   }
 }

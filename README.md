@@ -17,6 +17,7 @@ This project includes an MCP (Model Context Protocol) server that provides accur
 The MCP server automatically creates and syncs the database on first tool call. No manual setup required!
 
 The server will:
+
 1. Validate that the provided project root contains a `rescript.json` file
 2. Compile your ReScript code (`bunx rescript`) if needed
 3. Create and sync the database (`rescript.db` at project root)
@@ -30,17 +31,16 @@ The server will:
 # First, ensure ReScript code is compiled
 bunx rescript
 # Then sync the database (indexes all packages and dependencies)
-bun mcp.js --sync
+bun mcp/index.js --sync
 ```
 
 ### Key Features
 
-- **Simplified API**: Use fully qualified names like `"Array.t"` instead of complex objects
-- **Global Types Support**: Access basic ReScript types like `"string"`, `"int"`, `"bool"` directly
-- **Multiple Flag Syntax**: Use multiple `--test-type` and `--test-value` flags instead of JSON arrays
-- **Automatic Alias Resolution**: `"Array"` automatically resolves to `"Belt_Array"`
-- **Partial Results**: Batch operations return results for all requests, even if some fail
+- **SQL-Based Queries**: Execute raw SQL SELECT queries directly against the database for maximum flexibility
+- **Schema Documentation**: Complete database schema and example queries documented in `.cursor/rules/rescript-db-schema.mdc`
+- **Minimal Context Bloat**: Schema documentation in rules file (loaded once), not in every tool call
 - **Fast Querying**: SQLite database with optimized indexes for sub-second lookups
+- **Readonly Safety**: Only SELECT queries allowed, database opened in readonly mode
 
 **Performance:** The sync uses parallel processing (Piscina worker pool) and file hashing for incremental updates:
 
@@ -50,99 +50,69 @@ bun mcp.js --sync
 - File-level caching: skips files when content hash matches
 - Parallel processing: uses 12 worker threads to extract documentation concurrently
 
-### Test the database
+### Database Schema
 
-Explore the database step by step - drill down from packages to modules to individual types/values:
+The database schema and example SQL queries are documented in `.cursor/rules/rescript-db-schema.mdc`. This file contains:
 
-```shell
-# Step 1: List all indexed packages
-bun mcp.js --test-query all
+- Complete table definitions with columns, foreign keys, and indexes
+- Example SQL queries for common operations
+- Notes on alias resolution patterns
+- Important: All values must be inlined in SQL queries (no parameters)
 
-# Step 2: Explore a specific package (shows top-level modules)
-bun mcp.js --test-query "ronnies.be"
+### Using the SQL Query Tool
 
-# Step 3: Drill into a specific module (shows types and values)
-bun mcp.js --test-module "Iluvatar"
+The `query_rescript_database` tool accepts raw SQL SELECT queries. All values must be inlined directly in the query string.
 
-# Step 4: Query specific types/values using the simplified API
-bun mcp.js --test-type "React.element"
-bun mcp.js --test-value "Array.map"
+**Example queries:**
 
-# Step 5: Search within a module
-bun mcp.js --test-module "FetchAPI-WebAPI" --test-module-search-term "response"                           # Search all for "response"
-bun mcp.js --test-module "FetchAPI-WebAPI" --test-module-search-term "response" --test-module-search-type "types" # Search only types for "response"
-bun mcp.js --test-module "Stdlib_Array" --test-module-search-term "map" --test-module-search-type "values"        # Search only values for "map"
+```sql
+-- List all packages
+SELECT name, path FROM packages ORDER BY name
 
-# Step 5b: Search using module aliases
-bun mcp.js --test-module "Array" --test-module-search-term "fil"                    # Search for "fil" in Array (resolves to Belt_Array)
-bun mcp.js --test-module "Promise" --test-module-search-term "all"                  # Search for "all" in Promise (resolves to Stdlib_Promise)
-bun mcp.js --test-module "List" --test-module-search-term "map" --test-module-search-type "values"  # Search values for "map" in List
+-- Get modules in a package
+SELECT m.id, m.qualified_name, m.source_file_path
+FROM modules m
+JOIN packages p ON m.package_id = p.id
+WHERE p.name = '@rescript/react' AND m.parent_module_id IS NULL
+ORDER BY m.qualified_name
 
-# Step 5c: Query types and values using aliases with the simplified API
-bun mcp.js --test-type "Null.t"                    # Query Null.t (resolves to Stdlib_Null.t)
-bun mcp.js --test-type "Array.t"                   # Query Array.t (resolves to Belt_Array.t)
-bun mcp.js --test-type "Promise.t"                 # Query Promise.t (resolves to Stdlib_Promise.t)
-bun mcp.js --test-value "Array.map"                # Query Array.map (resolves to Belt_Array.map)
-bun mcp.js --test-value "Null.make"                # Query Null.make (resolves to Stdlib_Null.make)
+-- Get types in a module
+SELECT name, kind, signature, detail
+FROM types
+WHERE module_id = (SELECT id FROM modules WHERE qualified_name = 'React')
+ORDER BY name
 
-# Step 6: Discover global symbols
-bun mcp.js --test-global-symbols                    # Show all globally available symbols
-bun mcp.js --test-global-symbols --test-global-symbols-package "ronnies.be"  # Show global symbols for specific package
+-- Get values in a module
+SELECT name, signature, param_count, return_type, detail
+FROM "values"
+WHERE module_id = (SELECT id FROM modules WHERE qualified_name = 'React')
+ORDER BY name
 
-# Step 7: Find type usage across all modules
-bun mcp.js --test-type-usage "String.t"             # Find where string type is used globally
-bun mcp.js --test-type-usage "String.t" --test-type-usage-filter "Iluvatar"  # Filter results to only show Iluvatar module
-bun mcp.js --test-type-usage "Null.t"               # Find where nullable types are used globally
-bun mcp.js --test-type-usage "Option.t"             # Find where option types are used globally
+-- Search for modules
+SELECT m.qualified_name, p.name as package_name
+FROM modules m
+JOIN packages p ON m.package_id = p.id
+WHERE LOWER(m.qualified_name) LIKE LOWER('%React%')
+ORDER BY m.qualified_name
 
-# Step 8: Test generic type parser
-bun mcp.js --test-generic-parse "Null.t<Option.t<string>>"  # Test parser with nested generics
-bun mcp.js --test-generic-parse "(string, int) => bool"     # Test parser with function types
+-- Search for types
+SELECT t.name, t.kind, t.signature, m.qualified_name as module_name, p.name as package_name
+FROM types t
+JOIN modules m ON t.module_id = m.id
+JOIN packages p ON m.package_id = p.id
+WHERE LOWER(t.name) LIKE LOWER('%element%')
+ORDER BY t.name
 
-# Step 9: Type and value lookups with global types support
-bun mcp.js --test-type string --test-type "Array.t" --test-type "React.element"  # Global + module types
-bun mcp.js --test-value "+" --test-value "Array.map" --test-value "React.useState"  # Global + module values
-bun mcp.js --test-type "int" --test-type "bool" --test-type "option" --test-type "list"  # All global types
-bun mcp.js --test-value "==" --test-value "!=" --test-value "&&" --test-value "||"  # Global operators
-
-# More examples:
-bun mcp.js --test-query "@rescript/react"
-bun mcp.js --test-query "@rescript/runtime"
-bun mcp.js --test-module "React.Children"        # Nested module
-bun mcp.js --test-module "Stdlib_Array"          # Array in source code
-bun mcp.js --test-module "DOMAPI-WebAPI"         # Module with namespace
-bun mcp.js --test-module "Buffer-RescriptBun"    # Module with namespace
-bun mcp.js --test-type "React.element"           # Module type
-bun mcp.js --test-type "DOMAPI-WebAPI.element"   # Type with namespace
-bun mcp.js --test-value "React.useState"         # Module value
-bun mcp.js --test-value "Stdlib_Array.map"       # Module value
-
-# Step 10: Unified search across all packages, modules, types, and values
-bun mcp.js --test-search "useState"              # Find all items matching "useState"
-bun mcp.js --test-search "element"               # Find all items matching "element" (types, modules, values)
-bun mcp.js --test-search "clipboard" --test-search-max 10  # Limit results to 10
-bun mcp.js --test-search "element" --test-search-category "types"  # Only search types
-bun mcp.js --test-search "fetch" --test-search-category "values"   # Only search values/functions
+-- Search for values
+SELECT v.name, v.signature, v.param_count, m.qualified_name as module_name, p.name as package_name
+FROM "values" v
+JOIN modules m ON v.module_id = m.id
+JOIN packages p ON m.package_id = p.id
+WHERE LOWER(v.name) LIKE LOWER('%useState%')
+ORDER BY v.name
 ```
 
-### Search Tool Usage
-
-The `search_rescript_codebase` tool provides unified search across all indexed ReScript packages, modules, types, and values. It's the best starting point when you don't know exactly what you're looking for.
-
-**When to use search vs other tools:**
-- Use `search_rescript_codebase` for **discovery** - when you want to find what's available
-- Use other tools (`get_types`, `get_values`, etc.) for **detailed exploration** - when you know what you want to examine
-
-**Search features:**
-- **Smart ranking**: Exact matches score highest, then partial matches. Values and types are prioritized over modules and packages.
-- **Category filtering**: Search only specific categories (packages, modules, types, values, or all)
-- **Contextual suggestions**: Get suggestions for follow-up tool calls based on what was found
-- **Result limiting**: Control the number of results returned
-
-**Example workflows:**
-1. Search for "clipboard" → find Clipboard-WebAPI module, writeText function, clipboard type
-2. Search for "useState" → find React.useState hook with suggestions to use get_values
-3. Search for "element" → find DOM element types with suggestions to use get_types and get_type_usage
+See `.cursor/rules/rescript-db-schema.mdc` for complete schema documentation and more example queries.
 
 ### Use with MCP clients
 
@@ -153,7 +123,7 @@ To use the MCP server with an LLM client (like Claude Desktop or Cursor), add it
   "mcpServers": {
     "rescript": {
       "command": "bun",
-      "args": ["mcp.js", "--stdio"],
+      "args": ["mcp/index.js", "--stdio"],
       "cwd": "/absolute/path/to/your/rescript/project"
     }
   }
@@ -170,16 +140,23 @@ Common errors and solutions:
 - **"Compilation failed"** - Run `bunx rescript` manually in the project directory to see detailed errors
 - **"No packages found"** - Check that `rescript.json` is properly configured with dependencies
 
-The server provides these tools:
+The server provides two tools:
 
-- `list_rescript_packages` - List all indexed packages
-- `get_rescript_package_modules` - Get modules in a package (with automatic alias resolution)
-- `get_rescript_module_info` - Get types, values, and aliases in a module (with optional search/filter and alias resolution)
-- `get_global_symbols` - Get all globally available symbols from auto-opened modules (Stdlib, Pervasives, and -open modules)
-- `get_type_usage` - Find where a specific type is used across all modules in the codebase (global cross-module search with optional filtering)
-- `get_types` - Lookup for multiple types in a single call (with automatic alias resolution, global types support, and partial results)
-- `get_values` - Lookup for multiple values/functions in a single call (with automatic alias resolution, global values support, and partial results)
-- `search_rescript_codebase` - Unified search across all packages, modules, types, and values with a single query (with ranking, filtering, and contextual suggestions)
-- `sync_rescript_database` - Manually trigger a full database sync (useful when project dependencies or code have changed)
+- `sync_rescript_database` - Sync the ReScript database with the current project. Compiles ReScript code and indexes all modules, types, and values. Returns sync statistics.
+- `query_rescript_database` - Execute raw SQL SELECT queries against the database. Only SELECT queries are allowed for security. Returns query results as an array of row objects.
 
-The database is automatically created and synced on first tool call. For manual syncs, use the `sync_rescript_database` tool or run `bun mcp.js --sync` from your project root.
+**Important Notes:**
+
+- The `query_rescript_database` tool does NOT accept SQL parameters. All values must be inlined directly in the SQL query string.
+- The database schema and example queries are documented in `.cursor/rules/rescript-db-schema.mdc`.
+- The database is automatically created and synced on first tool call. For manual syncs, use the `sync_rescript_database` tool or run `bun mcp/index.js --sync` from your project root.
+
+### Testing with Inspector
+
+You can test the MCP server interactively using the inspector:
+
+```shell
+bun start
+```
+
+This runs the MCP server with the inspector, allowing you to test tool calls and see responses in a web interface.

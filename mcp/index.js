@@ -1408,6 +1408,50 @@ function resolveModuleAlias(db, moduleName) {
 }
 
 // ============================================================================
+// Namespace Mapping Helper
+// ============================================================================
+
+/**
+ * Convert qualified name (internal format) to code access path (user-facing format)
+ * Examples:
+ *   "Global-WebAPI" -> "WebAPI.Global"
+ *   "DOMAPI-WebAPI" -> "WebAPI.DOMAPI"
+ *   "React.Children" -> "React.Children" (nested modules, no namespace)
+ *   "Stdlib_Array" -> "Array" (if aliased) or "Stdlib_Array" (if not)
+ */
+function qualifiedNameToCodePath(qualifiedName) {
+  if (!qualifiedName) return qualifiedName;
+
+  // Check if it contains namespace separator (ModuleName-Namespace)
+  const namespaceMatch = qualifiedName.match(
+    /^([A-Za-z_][A-Za-z0-9_]*)-([A-Za-z_][A-Za-z0-9_.]*)$/,
+  );
+  if (namespaceMatch) {
+    const [, moduleName, namespace] = namespaceMatch;
+    // Convert to code access path: Namespace.ModuleName
+    // Handle nested namespaces (e.g., "Module-SubNamespace.Namespace" -> "SubNamespace.Namespace.Module")
+    const namespaceParts = namespace.split(".");
+    namespaceParts.push(moduleName);
+    return namespaceParts.join(".");
+  }
+
+  // No namespace, return as-is (could be nested module like "React.Children")
+  return qualifiedName;
+}
+
+/**
+ * Get both qualified name and code access path for a module
+ */
+function getModulePaths(qualifiedName) {
+  const codePath = qualifiedNameToCodePath(qualifiedName);
+  return {
+    qualifiedName, // Internal format (e.g., "Global-WebAPI")
+    codePath, // Code access path (e.g., "WebAPI.Global")
+    ...(qualifiedName !== codePath && { hasNamespace: true }),
+  };
+}
+
+// ============================================================================
 // Core Lookup Functions
 // ============================================================================
 
@@ -1513,6 +1557,9 @@ async function getTypeDetails(db, qualifiedModuleName, typeName) {
     usageHint = `Pattern match with: ${constructors}`;
   }
 
+  // Get module paths (qualified name and code access path)
+  const modulePaths = getModulePaths(resolvedModule.qualified_name);
+
   const typeResult = {
     name: type.name,
     kind: type.kind || "unknown",
@@ -1521,6 +1568,10 @@ async function getTypeDetails(db, qualifiedModuleName, typeName) {
     genericParameters: genericParameters,
     typeReferences: typeReferences,
     usageHint: usageHint,
+    module: {
+      qualifiedName: resolvedModule.qualified_name,
+      ...modulePaths,
+    },
     ...(resolvedFromAlias && { resolvedFromAlias }),
   };
 
@@ -1585,12 +1636,19 @@ async function getValueDetails(db, qualifiedModuleName, valueName) {
     };
   }
 
+  // Get module paths (qualified name and code access path)
+  const modulePaths = getModulePaths(resolvedModule.qualified_name);
+
   const valueResult = {
     name: value.name,
     signature: value.signature,
     paramCount: value.param_count,
     returnType: value.return_type,
     detail: JSON.parse(value.detail),
+    module: {
+      qualifiedName: resolvedModule.qualified_name,
+      ...modulePaths,
+    },
     ...(resolvedFromAlias && { resolvedFromAlias }),
   };
 
@@ -1688,13 +1746,15 @@ async function searchCodebase(
         mod.qualified_name,
         searchTermLower,
       );
+      const modulePaths = getModulePaths(mod.qualified_name);
       results.push({
         category: "module",
         name: mod.qualified_name,
         qualifiedName: mod.qualified_name,
+        codePath: modulePaths.codePath,
         packageName: mod.package_name,
         signature: undefined,
-        description: `Module: ${mod.qualified_name}`,
+        description: `Module: ${mod.qualified_name}${modulePaths.hasNamespace ? ` (access as: ${modulePaths.codePath})` : ""}`,
         matchScore: matchScore,
         categoryPriority: getCategoryPriority("module"),
       });
@@ -1718,13 +1778,15 @@ async function searchCodebase(
 
     for (const type of types) {
       const matchScore = calculateMatchScore(type.name, searchTermLower);
+      const modulePaths = getModulePaths(type.module_name);
       results.push({
         category: "type",
         name: type.name,
         qualifiedName: `${type.module_name}.${type.name}`,
+        codePath: `${modulePaths.codePath}.${type.name}`,
         packageName: type.package_name,
         signature: type.signature,
-        description: `${type.kind || "type"}: ${type.name}`,
+        description: `${type.kind || "type"}: ${type.name}${modulePaths.hasNamespace ? ` (access as: ${modulePaths.codePath}.${type.name})` : ""}`,
         matchScore: matchScore,
         categoryPriority: getCategoryPriority("type"),
       });
@@ -1748,13 +1810,15 @@ async function searchCodebase(
 
     for (const value of values) {
       const matchScore = calculateMatchScore(value.name, searchTermLower);
+      const modulePaths = getModulePaths(value.module_name);
       results.push({
         category: "value",
         name: value.name,
         qualifiedName: `${value.module_name}.${value.name}`,
+        codePath: `${modulePaths.codePath}.${value.name}`,
         packageName: value.package_name,
         signature: value.signature,
-        description: `Function (${value.param_count} params): ${value.name}`,
+        description: `Function (${value.param_count} params): ${value.name}${modulePaths.hasNamespace ? ` (access as: ${modulePaths.codePath}.${value.name})` : ""}`,
         matchScore: matchScore,
         categoryPriority: getCategoryPriority("value"),
       });
@@ -1799,6 +1863,7 @@ async function searchCodebase(
       category: r.category,
       name: r.name,
       qualifiedName: r.qualifiedName,
+      codePath: r.codePath,
       packageName: r.packageName,
       signature: r.signature,
       description: r.description,
@@ -1815,43 +1880,41 @@ async function searchCodebase(
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { parseArgs } from "node:util";
 
 const server = new McpServer({
   name: "ReScript Project Assistant",
   version: "1.0.0",
   description:
-    "Provides accurate ReScript module, type, and value information from indexed projects. Indexes compiled ReScript code and stores it in SQLite for fast querying. Supports namespaced modules (e.g., 'DOMAPI-WebAPI'), nested modules (e.g., 'React.Children'), multiple lookups in single calls, global types/values, and provides comprehensive documentation for types and values.\n\nIMPORTANT: Use MCP tools for function signatures, type definitions, and module exploration. Use traditional grep/search for code patterns, usage examples, and implementation details. MCP tools excel at finding declared symbols but cannot find code patterns or usage examples.",
+    "Provides accurate ReScript module, type, and value information from indexed projects. Indexes compiled ReScript code and stores it in SQLite for fast querying. Supports namespaced modules (e.g., 'DOMAPI-WebAPI'), nested modules (e.g., 'React.Children'), multiple lookups in single calls, global types/values, and provides comprehensive documentation for types and values.\n\n" +
+    "WHAT IT CAN DO:\n" +
+    "- API exploration: Discover available functions, types, and modules\n" +
+    "- Signature discovery: Get exact function signatures, parameter counts, and return types\n" +
+    "- Type definitions: Understand type structures and variants\n" +
+    "- Module hierarchy: Explore module relationships and qualified names\n" +
+    "- Namespace mapping: Convert qualified names to code access paths\n\n" +
+    "WHAT IT CANNOT DO:\n" +
+    "- Code examples: Does not provide actual code implementations or usage examples from your codebase\n" +
+    "- Usage patterns: Does not show how functions are typically used together in practice\n" +
+    "- Implementation details: Cannot find actual code implementations or usage in your codebase\n\n" +
+    "IMPORTANT: Use MCP tools for function signatures, type definitions, and module exploration. Use traditional grep/search for code patterns, usage examples, and implementation details.",
   capabilities: {
     resources: {},
     tools: {},
   },
 });
 
-// Tool 1: List all indexed packages
+// ============================================================================
+// MCP Tools
+// ============================================================================
+
+// Tool 1: Sync database
 server.registerTool(
-  "list_rescript_packages",
+  "sync_rescript_database",
   {
-    description: `List all ReScript packages that have been indexed in the database.
+    description: `Sync the ReScript database with the current project. Compiles ReScript code and indexes all modules, types, and values. This may take 10-30 seconds on first run or when significant changes are detected.
 
-WHAT YOU GET:
-- packages: Array of all available packages with their names and paths
-- Use this to see what packages are available before exploring specific modules
-
-WORKFLOW:
-1. Call this tool to see available packages
-2. Use get_rescript_package_modules to explore a specific package
-3. Use get_rescript_module_info to dive into specific modules
-
-WHEN TO USE:
-✅ Use this for discovering available packages and their structure
-❌ Don't use this for finding specific functions or code patterns (use grep instead)
-
-BAD EXAMPLES TO AVOID:
-❌ Searching for "async component" - MCP tools can't find code patterns
-❌ Looking for "dict{" usage - MCP tools can't find syntax patterns  
-❌ Finding "let make = async" - MCP tools can't find code examples
-
-Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds.`,
+Note: This tool requires being called from within a ReScript project directory (with rescript.json).`,
     inputSchema: {
       projectRoot: z
         .string()
@@ -1860,28 +1923,75 @@ Note: This tool requires being called from within a ReScript project directory (
         ),
     },
     outputSchema: {
-      packages: z.array(
-        z.object({
-          name: z.string(),
-          path: z.string(),
-        }),
-      ),
+      success: z.boolean(),
+      stats: z.object({
+        packages: z.number(),
+        modules: z.number(),
+        types: z.number(),
+        values: z.number(),
+        typeReferences: z.number(),
+        genericParameters: z.number(),
+      }),
+      duration: z.string(),
     },
   },
   async (args) => {
     try {
       const { projectRoot } = args;
+      const startTime = performance.now();
+
+      // Capture console.error output by temporarily overriding it
+      const originalError = console.error;
+      const errorMessages = [];
+      console.error = (...args) => {
+        errorMessages.push(args.join(" "));
+        originalError(...args);
+      };
+
+      await syncDatabase(projectRoot);
+
+      // Restore console.error
+      console.error = originalError;
+
+      // Get stats from database
       const db = await ensureDatabaseInitialized(projectRoot);
-      const packages = db
-        .query("SELECT name, path FROM packages ORDER BY name")
-        .all();
+      const stats = {
+        packages: db.query("SELECT COUNT(*) as count FROM packages").get()
+          .count,
+        modules: db.query("SELECT COUNT(*) as count FROM modules").get().count,
+        types: db.query("SELECT COUNT(*) as count FROM types").get().count,
+        values: db.query('SELECT COUNT(*) as count FROM "values"').get().count,
+        typeReferences: db
+          .query("SELECT COUNT(*) as count FROM type_references")
+          .get().count,
+        genericParameters: db
+          .query("SELECT COUNT(*) as count FROM generic_type_parameters")
+          .get().count,
+      };
       db.close();
+
+      const duration = ((performance.now() - startTime) / 1000).toFixed(2);
 
       return {
         content: [
-          { type: "text", text: JSON.stringify({ packages }, null, 2) },
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                success: true,
+                stats,
+                duration: `${duration}s`,
+              },
+              null,
+              2,
+            ),
+          },
         ],
-        structuredContent: { packages },
+        structuredContent: {
+          success: true,
+          stats,
+          duration: `${duration}s`,
+        },
       };
     } catch (ex) {
       return {
@@ -1897,35 +2007,23 @@ Note: This tool requires being called from within a ReScript project directory (
   },
 );
 
-// Tool 2: Get top-level modules for a package
+// Tool 2: Query database with raw SQL
 server.registerTool(
-  "get_rescript_package_modules",
+  "query_rescript_database",
   {
-    description: `Get all top-level modules (and their nested modules) for a specific package.
+    description: `Execute a raw SQL SELECT query against the ReScript database. Only SELECT queries are allowed for security. The database schema is documented in rescript-db-schema.mdc.
 
-WHAT YOU GET:
-- modules: Array of top-level modules in the package
-- Each module shows its qualified name and nested sub-modules
-- Use this to explore what modules are available before diving deeper
+Use this tool to query packages, modules, types, values, aliases, type references, and generic parameters. See rescript-db-schema.mdc for the complete schema and example queries.
 
-WORKFLOW:
-1. Use list_rescript_packages to find available packages
-2. Use this tool to explore modules in a specific package
-3. Use get_rescript_module_info to get detailed info about specific modules
+WHAT IT CAN DO:
+- Query database schema: Access packages, modules, types, values, aliases, type references, and generic parameters
+- Complex queries: Join tables to find relationships between symbols
+- Filter and search: Use SQL WHERE clauses to filter results
 
-EXAMPLES:
-- Explore @rescript/webapi: see all WebAPI modules like DOMAPI-WebAPI, FetchAPI-WebAPI
-- Explore React: see React and its nested modules like React.Children
-
-WHEN TO USE:
-✅ Use this for discovering module structure and hierarchy
-✅ Use this to find the right module before looking up specific functions
-❌ Don't use this for finding specific function implementations (use grep instead)
-
-BAD EXAMPLES TO AVOID:
-❌ Searching for "async" - MCP tools can't find code patterns
-❌ Looking for "JSON.Object" usage - MCP tools can't find syntax examples
-❌ Finding "React.use" patterns - MCP tools can't find code snippets
+WHAT IT CANNOT DO:
+- Code examples: Does not return actual code implementations
+- Usage patterns: Cannot show how symbols are used in your codebase
+- Pattern matching: Use grep/search for finding code patterns
 
 Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds.`,
     inputSchema: {
@@ -1934,1148 +2032,93 @@ Note: This tool requires being called from within a ReScript project directory (
         .describe(
           "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
         ),
-      packageName: z
+      sql: z
         .string()
         .describe(
-          "The name of the ReScript package. Examples: '@rescript/runtime', '@rescript/react', 'ronnies.be', 'rescript-pocketbase'",
+          "SQL SELECT query to execute. Only SELECT statements are allowed. All values must be inlined directly in the query string (no parameters).",
         ),
     },
     outputSchema: {
-      modules: z.array(
-        z.object({
-          qualifiedName: z.string(),
-          nestedModules: z.array(z.string()),
-        }),
-      ),
-    },
-  },
-  async ({ projectRoot, packageName }) => {
-    if (!packageName) {
-      throw new Error("packageName is required");
-    }
-
-    try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-
-      // Get package ID
-      const pkg = db
-        .query("SELECT id FROM packages WHERE name = ?")
-        .get(packageName);
-      if (!pkg) {
-        db.close();
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Package '${packageName}' not found in database. Run sync first.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Get top-level modules (no parent)
-      const topLevelModules = db
-        .query(
-          `
-        SELECT id, qualified_name 
-        FROM modules 
-        WHERE package_id = ? AND parent_module_id IS NULL 
-        ORDER BY qualified_name
-      `,
-        )
-        .all(pkg.id);
-
-      const modules = topLevelModules.map((mod) => {
-        // Get nested modules
-        const nested = db
-          .query(
-            `
-          SELECT qualified_name 
-          FROM modules 
-          WHERE parent_module_id = ? 
-          ORDER BY qualified_name
-        `,
-          )
-          .all(mod.id);
-
-        return {
-          qualifiedName: mod.qualified_name,
-          nestedModules: nested.map((n) => n.qualified_name),
-        };
-      });
-
-      db.close();
-
-      return {
-        content: [{ type: "text", text: JSON.stringify({ modules }, null, 2) }],
-        structuredContent: { modules },
-      };
-    } catch (ex) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${ex.message}\n\nAttempted projectRoot: ${projectRoot || "not provided"}\n\nSuggestion: Check that projectRoot points to a directory with rescript.json`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-// Tool 3: Get module information (nested modules, types, values)
-server.registerTool(
-  "get_rescript_module_info",
-  {
-    description: `Get detailed information about a ReScript module including its types, values, and nested modules.
-
-WHAT YOU GET:
-- types: Type definitions (records, variants, etc.) with their signatures
-- values: Functions, constants, and other values with their signatures  
-- nestedModules: Sub-modules within this module
-- qualifiedName: The full module path used in ReScript code
-
-HOW TO USE THE RESULTS:
-- Use 'signature' fields to understand function/type definitions
-- Follow type references (e.g., 'WebAPI.ClipboardAPI.clipboard') to other modules
-- Use 'paramCount' to understand function arity
-- Combine with get_rescript_package_modules to explore module hierarchy
-
-EXAMPLES:
-- Find clipboard API: search for 'clipboard' in 'DOMAPI-WebAPI' 
-- Explore React hooks: search for 'use' in 'React'
-- Check available functions: search for 'values' type in any module
-
-WHEN TO USE:
-✅ Use this for getting exact function signatures and type definitions
-✅ Use this to discover what functions/types are available in a module
-✅ Use this for understanding parameter counts and return types
-❌ Don't use this for finding code patterns or usage examples (use grep instead)
-
-BAD EXAMPLES TO AVOID:
-❌ Searching for "async component" - MCP tools can't find code patterns
-❌ Looking for "dict{" usage - MCP tools can't find syntax patterns
-❌ Finding "let make = async" - MCP tools can't find code examples
-❌ Searching for "JSON.Object" usage - MCP tools can't find implementation details
-
-Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds.`,
-    inputSchema: {
-      projectRoot: z
-        .string()
-        .describe(
-          "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
-        ),
-      qualifiedModuleName: z
-        .string()
-        .describe(
-          "The fully qualified module name. Examples: 'Iluvatar', 'React.Children' (nested module), 'Stdlib_Array' (Array in source code), 'DOMAPI-WebAPI' (module with namespace), 'Buffer-RescriptBun' (module with namespace)",
-        ),
-      searchTerm: z
-        .string()
-        .optional()
-        .describe(
-          "Optional search string for filtering results. Performs case-insensitive substring matching on names.",
-        ),
-      searchType: z
-        .enum(["types", "values", "nested-modules", "aliases", "all"])
-        .optional()
-        .describe(
-          "Optional filter type. When provided with searchTerm, only returns results of this type. Defaults to 'all' when searchTerm is provided.",
-        ),
-    },
-    outputSchema: {
-      module: z.object({
-        qualifiedName: z
-          .string()
-          .describe("Full module path (e.g., 'WebAPI.DOMAPI')"),
-        sourceFilePath: z
-          .string()
-          .optional()
-          .describe("Path to the source file"),
-        nestedModules: z
-          .array(z.string())
-          .describe("Sub-modules you can explore further"),
-        types: z
-          .array(
-            z.object({
-              name: z.string().describe("Type name as used in ReScript code"),
-              kind: z
-                .string()
-                .describe("Type kind: 'record', 'variant', 'abstract', etc."),
-              signature: z
-                .string()
-                .optional()
-                .describe(
-                  "Full type definition - use this to understand the type structure",
-                ),
-            }),
-          )
-          .describe("Type definitions available in this module"),
-        values: z
-          .array(
-            z.object({
-              name: z
-                .string()
-                .describe("Function/value name as used in ReScript code"),
-              signature: z
-                .string()
-                .optional()
-                .describe(
-                  "Function signature showing parameters and return type",
-                ),
-              paramCount: z
-                .number()
-                .describe("Number of parameters this function takes"),
-            }),
-          )
-          .describe(
-            "Functions, constants, and other values available in this module",
-          ),
-        aliases: z
-          .array(
-            z.object({
-              name: z.string().describe("Alias name"),
-              kind: z
-                .string()
-                .describe("What the alias points to (type/value/module)"),
-              targetQualifiedName: z
-                .string()
-                .describe("Full path to the actual module/type/value"),
-            }),
-          )
-          .describe("Module aliases that redirect to other modules"),
-        resolvedFromAlias: z
-          .string()
-          .nullable()
-          .optional()
-          .describe(
-            "If this module was resolved from an alias, shows the alias path",
-          ),
-      }),
-    },
-  },
-  async ({ projectRoot, qualifiedModuleName, searchTerm, searchType }) => {
-    if (!qualifiedModuleName) {
-      throw new Error("qualifiedModuleName is required");
-    }
-
-    try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-
-      // Get module with alias resolution
-      const { module, resolvedFromAlias } = resolveModuleAlias(
-        db,
-        qualifiedModuleName,
-      );
-
-      if (!module) {
-        db.close();
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Module '${qualifiedModuleName}' not found in database.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Determine search behavior
-      const hasSearch = searchTerm && searchTerm.trim() !== "";
-      const effectiveSearchType = hasSearch && !searchType ? "all" : searchType;
-      const searchPattern = hasSearch ? `%${searchTerm}%` : null;
-
-      // Get nested modules
-      let nestedModulesQuery = `
-        SELECT qualified_name 
-        FROM modules 
-        WHERE parent_module_id = ? 
-      `;
-      let nestedModulesParams = [module.id];
-
-      if (
-        hasSearch &&
-        (effectiveSearchType === "all" ||
-          effectiveSearchType === "nested-modules")
-      ) {
-        nestedModulesQuery += ` AND LOWER(qualified_name) LIKE LOWER(?)`;
-        nestedModulesParams.push(searchPattern);
-      }
-
-      nestedModulesQuery += ` ORDER BY qualified_name`;
-
-      const nestedModules = db
-        .query(nestedModulesQuery)
-        .all(...nestedModulesParams);
-
-      // Get types
-      let typesQuery = `
-        SELECT name, kind, signature 
-        FROM types 
-        WHERE module_id = ? 
-      `;
-      let typesParams = [module.id];
-
-      if (
-        hasSearch &&
-        (effectiveSearchType === "all" || effectiveSearchType === "types")
-      ) {
-        typesQuery += ` AND LOWER(name) LIKE LOWER(?)`;
-        typesParams.push(searchPattern);
-      }
-
-      typesQuery += ` ORDER BY name`;
-
-      const types = db.query(typesQuery).all(...typesParams);
-
-      // Get values
-      let valuesQuery = `
-        SELECT name, signature, param_count 
-        FROM "values" 
-        WHERE module_id = ? 
-      `;
-      let valuesParams = [module.id];
-
-      if (
-        hasSearch &&
-        (effectiveSearchType === "all" || effectiveSearchType === "values")
-      ) {
-        valuesQuery += ` AND LOWER(name) LIKE LOWER(?)`;
-        valuesParams.push(searchPattern);
-      }
-
-      valuesQuery += ` ORDER BY name`;
-
-      const values = db.query(valuesQuery).all(...valuesParams);
-
-      // Get aliases
-      let aliasesQuery = `
-        SELECT alias_name, alias_kind, target_qualified_name 
-        FROM aliases 
-        WHERE source_module_id = ? 
-      `;
-      let aliasesParams = [module.id];
-
-      if (
-        hasSearch &&
-        (effectiveSearchType === "all" || effectiveSearchType === "aliases")
-      ) {
-        aliasesQuery += ` AND LOWER(alias_name) LIKE LOWER(?)`;
-        aliasesParams.push(searchPattern);
-      }
-
-      aliasesQuery += ` ORDER BY alias_name`;
-
-      const aliases = db.query(aliasesQuery).all(...aliasesParams);
-
-      db.close();
-
-      const result = {
-        module: {
-          qualifiedName: module.qualified_name,
-          sourceFilePath: module.source_file_path,
-          nestedModules: nestedModules.map((m) => m.qualified_name),
-          types: types.map((t) => ({
-            name: t.name,
-            kind: t.kind || "unknown",
-            signature: t.signature,
-          })),
-          values: values.map((v) => ({
-            name: v.name,
-            signature: v.signature,
-            paramCount: v.param_count,
-          })),
-          aliases: aliases.map((a) => ({
-            name: a.alias_name,
-            kind: a.alias_kind,
-            targetQualifiedName: a.target_qualified_name,
-          })),
-          resolvedFromAlias,
-        },
-      };
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        structuredContent: result,
-      };
-    } catch (ex) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${ex.message}\n\nAttempted projectRoot: ${projectRoot || "not provided"}\n\nSuggestion: Check that projectRoot points to a directory with rescript.json`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-// Tool 4: Get global symbols
-server.registerTool(
-  "get_global_symbols",
-  {
-    description:
-      "Get all symbols (types, values, module aliases) that are globally available in any ReScript file. This includes symbols from Stdlib, Pervasives, and modules opened via -open compiler flag. Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds. If called from outside a ReScript project, will return an error.",
-    inputSchema: {
-      projectRoot: z
-        .string()
-        .describe(
-          "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
-        ),
-      packageName: z
-        .string()
-        .optional()
-        .describe(
-          "Optional package name to filter global symbols for a specific package context",
-        ),
-    },
-    outputSchema: {
-      globalSymbols: z.array(
-        z.object({
-          moduleName: z.string(),
-          packageName: z.string(),
-          isAutoOpened: z.boolean(),
-          types: z.array(
-            z.object({
-              name: z.string(),
-              kind: z.string(),
-              signature: z.string().optional(),
-            }),
-          ),
-          values: z.array(
-            z.object({
-              name: z.string(),
-              signature: z.string().optional(),
-              paramCount: z.number(),
-            }),
-          ),
-          aliases: z.array(
-            z.object({
-              name: z.string(),
-              kind: z.string(),
-              targetQualifiedName: z.string(),
-            }),
-          ),
-        }),
-      ),
-    },
-  },
-  async ({ projectRoot, packageName }) => {
-    try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-
-      // Get all auto-opened modules
-      let query = `
-        SELECT m.qualified_name, m.is_auto_opened, p.name as package_name
-        FROM modules m
-        JOIN packages p ON m.package_id = p.id
-        WHERE m.is_auto_opened = 1 AND m.parent_module_id IS NULL
-      `;
-      let params = [];
-
-      if (packageName) {
-        query += ` AND p.name = ?`;
-        params.push(packageName);
-      }
-
-      query += ` ORDER BY p.name, m.qualified_name`;
-
-      const autoOpenedModules = db.query(query).all(...params);
-
-      const globalSymbols = [];
-
-      for (const module of autoOpenedModules) {
-        // Get types for this module
-        const types = db
-          .query(
-            `
-          SELECT name, kind, signature 
-          FROM types 
-          WHERE module_id = (SELECT id FROM modules WHERE qualified_name = ?)
-          ORDER BY name
-        `,
-          )
-          .all(module.qualified_name);
-
-        // Get values for this module
-        const values = db
-          .query(
-            `
-          SELECT name, signature, param_count 
-          FROM "values" 
-          WHERE module_id = (SELECT id FROM modules WHERE qualified_name = ?)
-          ORDER BY name
-        `,
-          )
-          .all(module.qualified_name);
-
-        // Get aliases for this module
-        const aliases = db
-          .query(
-            `
-          SELECT alias_name, alias_kind, target_qualified_name 
-          FROM aliases 
-          WHERE source_module_id = (SELECT id FROM modules WHERE qualified_name = ?)
-          ORDER BY alias_name
-        `,
-          )
-          .all(module.qualified_name);
-
-        globalSymbols.push({
-          moduleName: module.qualified_name,
-          packageName: module.package_name,
-          isAutoOpened: Boolean(module.is_auto_opened),
-          types: types.map((t) => ({
-            name: t.name,
-            kind: t.kind || "unknown",
-            signature: t.signature,
-          })),
-          values: values.map((v) => ({
-            name: v.name,
-            signature: v.signature,
-            paramCount: v.param_count,
-          })),
-          aliases: aliases.map((a) => ({
-            name: a.alias_name,
-            kind: a.alias_kind,
-            targetQualifiedName: a.target_qualified_name,
-          })),
-        });
-      }
-
-      db.close();
-
-      return {
-        content: [
-          { type: "text", text: JSON.stringify({ globalSymbols }, null, 2) },
-        ],
-        structuredContent: { globalSymbols },
-      };
-    } catch (ex) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${ex.message}\n\nAttempted projectRoot: ${projectRoot || "not provided"}\n\nSuggestion: Check that projectRoot points to a directory with rescript.json`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-// Tool 5: Get type usage
-server.registerTool(
-  "get_type_usage",
-  {
-    description:
-      "Find where a specific type is used across all modules in the codebase. This provides global cross-module search to discover all functions, types, and fields that reference the specified type. Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds. If called from outside a ReScript project, will return an error.",
-    inputSchema: {
-      projectRoot: z
-        .string()
-        .describe(
-          "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
-        ),
-      qualifiedModuleName: z
-        .string()
-        .describe(
-          "The fully qualified module name. Examples: 'Stdlib_String', 'String' (with alias resolution). Use empty string for global types like 'string', 'int'.",
-        ),
-      typeName: z
-        .string()
-        .describe(
-          "The name of the type to search for. Examples: 't', 'string'",
-        ),
-      filter: z
-        .string()
-        .optional()
-        .describe(
-          "Optional case-insensitive filter to limit results. Filters by module name, type name, value name, or field name.",
-        ),
-    },
-    outputSchema: {
-      usedInTypes: z.array(
-        z.object({
-          module: z.string(),
-          type: z.string(),
-          field: z.string().optional(),
-          context: z.string(),
-          signature: z.string().optional(),
-        }),
-      ),
-      usedInValues: z.array(
-        z.object({
-          module: z.string(),
-          value: z.string(),
-          context: z.string(),
-          signature: z.string().optional(),
-        }),
-      ),
-      usedAsGenericParameter: z.array(
-        z.object({
-          module: z.string(),
-          type: z.string().optional(),
-          value: z.string().optional(),
-          field: z.string().optional(),
-          signature: z.string(),
-          baseType: z.string(),
-        }),
-      ),
-    },
-  },
-  async ({ projectRoot, qualifiedModuleName, typeName, filter }) => {
-    if (!typeName) {
-      throw new Error("typeName is required");
-    }
-
-    try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-
-      let resolvedModule, resolvedFromAlias;
-
-      if (!qualifiedModuleName || qualifiedModuleName === "") {
-        // Global type - stored in Pervasives module
-        resolvedModule = db
-          .query(
-            "SELECT id, qualified_name FROM modules WHERE qualified_name = 'Pervasives'",
-          )
-          .get();
-        resolvedFromAlias = null;
-      } else {
-        // Try to resolve module with alias resolution
-        const result = resolveModuleAlias(db, qualifiedModuleName);
-        resolvedModule = result.module;
-        resolvedFromAlias = result.resolvedFromAlias;
-      }
-
-      if (!resolvedModule) {
-        const moduleDisplayName = qualifiedModuleName || "global";
-        db.close();
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Type '${typeName}' not found in ${moduleDisplayName === "global" ? "global scope" : `module '${qualifiedModuleName}'`}.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // Find all type references for this type
-      const typeReferences = db
-        .query(
-          `
-        SELECT 
-          tr.context,
-          tr.position,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN t.name
-            WHEN tr.source_value_id IS NOT NULL THEN v.name
-            ELSE NULL
-          END as source_name,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN tm.qualified_name
-            WHEN tr.source_value_id IS NOT NULL THEN vm.qualified_name
-            ELSE NULL
-          END as source_module,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN 'type'
-            WHEN tr.source_value_id IS NOT NULL THEN 'value'
-            ELSE 'unknown'
-          END as source_kind,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN t.signature
-            WHEN tr.source_value_id IS NOT NULL THEN v.signature
-            ELSE NULL
-          END as source_signature
-        FROM type_references tr
-        LEFT JOIN types t ON tr.source_type_id = t.id
-        LEFT JOIN modules tm ON t.module_id = tm.id
-        LEFT JOIN "values" v ON tr.source_value_id = v.id
-        LEFT JOIN modules vm ON v.module_id = vm.id
-        WHERE (tr.referenced_type_name = ? AND tr.referenced_module_name = ?) 
-           OR (tr.referenced_type_name = ? AND (tr.referenced_module_name = '' OR tr.referenced_module_name IS NULL) AND vm.qualified_name = ?)
-        ORDER BY source_module, source_name, tr.context
-      `,
-        )
-        .all(
-          typeName,
-          resolvedModule.qualified_name,
-          typeName,
-          resolvedModule.qualified_name,
-        );
-
-      // Find all generic parameters that use this type
-      const genericParameters = db
-        .query(
-          `
-        SELECT 
-          gtp.parameter_signature,
-          gtp.base_type,
-          gtp.field_name,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN t.name
-            WHEN gtp.value_id IS NOT NULL THEN v.name
-            ELSE NULL
-          END as source_name,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN tm.qualified_name
-            WHEN gtp.value_id IS NOT NULL THEN vm.qualified_name
-            ELSE NULL
-          END as source_module,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN 'type'
-            WHEN gtp.value_id IS NOT NULL THEN 'value'
-            ELSE 'unknown'
-          END as source_kind,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN t.signature
-            WHEN gtp.value_id IS NOT NULL THEN v.signature
-            ELSE NULL
-          END as source_signature
-        FROM generic_type_parameters gtp
-        LEFT JOIN types t ON gtp.type_id = t.id
-        LEFT JOIN modules tm ON t.module_id = tm.id
-        LEFT JOIN "values" v ON gtp.value_id = v.id
-        LEFT JOIN modules vm ON v.module_id = vm.id
-        WHERE gtp.parameter_signature = ? OR gtp.parameter_signature = ? OR gtp.parameter_signature LIKE ? OR gtp.parameter_signature LIKE ?
-        ORDER BY source_module, source_name, gtp.parameter_signature
-      `,
-        )
-        .all(
-          typeName, // Exact match for global types
-          `${resolvedModule.qualified_name}.${typeName}`, // Exact match for qualified types
-          `%<${typeName}>%`, // Generic parameter like Type<React.element>
-          `%<${resolvedModule.qualified_name}.${typeName}>%`, // Generic parameter like Type<Module.Type>
-        );
-
-      db.close();
-
-      // Organize results
-      const usedInTypes = [];
-      const usedInValues = [];
-      const usedAsGenericParameter = [];
-
-      for (const ref of typeReferences) {
-        if (ref.source_kind === "type") {
-          usedInTypes.push({
-            module: ref.source_module,
-            type: ref.source_name,
-            field: ref.context.includes("field")
-              ? ref.context.split(" ")[1]
-              : undefined,
-            context: ref.context,
-            signature: ref.source_signature,
-          });
-        } else if (ref.source_kind === "value") {
-          usedInValues.push({
-            module: ref.source_module,
-            value: ref.source_name,
-            context: ref.context,
-            signature: ref.source_signature,
-          });
-        }
-      }
-
-      for (const param of genericParameters) {
-        usedAsGenericParameter.push({
-          module: param.source_module,
-          type: param.source_kind === "type" ? param.source_name : undefined,
-          value: param.source_kind === "value" ? param.source_name : undefined,
-          field: param.field_name === null ? undefined : param.field_name,
-          signature: param.parameter_signature,
-          baseType: param.base_type,
-        });
-      }
-
-      // Apply filtering if provided
-      const filterLower = filter ? filter.toLowerCase() : null;
-      const filterResults = (items) => {
-        if (!filterLower) return items;
-        return items.filter((item) => {
-          return (
-            item.module?.toLowerCase().includes(filterLower) ||
-            item.type?.toLowerCase().includes(filterLower) ||
-            item.value?.toLowerCase().includes(filterLower) ||
-            item.field?.toLowerCase().includes(filterLower) ||
-            item.context?.toLowerCase().includes(filterLower) ||
-            item.signature?.toLowerCase().includes(filterLower) ||
-            item.baseType?.toLowerCase().includes(filterLower)
-          );
-        });
-      };
-
-      const result = {
-        usedInTypes: filterResults(usedInTypes),
-        usedInValues: filterResults(usedInValues),
-        usedAsGenericParameter: filterResults(usedAsGenericParameter),
-        ...(resolvedFromAlias && { resolvedFromAlias }),
-        ...(filter && { filter }),
-      };
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        structuredContent: result,
-      };
-    } catch (ex) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${ex.message}\n\nAttempted projectRoot: ${projectRoot || "not provided"}\n\nSuggestion: Check that projectRoot points to a directory with rescript.json`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-// Tool 6: Get types
-server.registerTool(
-  "get_types",
-  {
-    description:
-      "Get detailed information for multiple types in a single call. Supports alias resolution, global types, and returns partial results if some lookups fail. Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds. If called from outside a ReScript project, will return an error.",
-    inputSchema: {
-      projectRoot: z
-        .string()
-        .describe(
-          "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
-        ),
-      typeNames: z
-        .array(z.string())
-        .describe(
-          "Array of fully qualified type names. Examples: 'React.element', 'Array.t', 'string', 'int' (global types)",
-        ),
-    },
-    outputSchema: {
-      results: z.array(
-        z.object({
-          typeName: z.string(),
-          success: z.boolean(),
-          type: z.any().optional(),
-          error: z.string().optional(),
-        }),
-      ),
-    },
-  },
-  async ({ projectRoot, typeNames }) => {
-    if (!typeNames || !Array.isArray(typeNames)) {
-      throw new Error("typeNames must be a non-empty array");
-    }
-
-    try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-      const results = [];
-
-      for (const typeName of typeNames) {
-        try {
-          // Parse the fully qualified type name
-          const parts = typeName.split(".");
-          let qualifiedModuleName, actualTypeName;
-
-          if (parts.length === 1) {
-            // Global type (e.g., "string", "int")
-            qualifiedModuleName = "";
-            actualTypeName = parts[0];
-          } else {
-            // Module type (e.g., "React.element", "Array.t")
-            actualTypeName = parts.pop();
-            qualifiedModuleName = parts.join(".");
-          }
-
-          const result = await getTypeDetails(
-            db,
-            qualifiedModuleName,
-            actualTypeName,
-          );
-          results.push({
-            typeName,
-            ...result,
-          });
-        } catch (error) {
-          results.push({
-            typeName,
-            success: false,
-            error: `Error processing request: ${error.message}`,
-          });
-        }
-      }
-
-      db.close();
-
-      return {
-        content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }],
-        structuredContent: { results },
-      };
-    } catch (ex) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${ex.message}\n\nAttempted projectRoot: ${projectRoot || "not provided"}\n\nSuggestion: Check that projectRoot points to a directory with rescript.json`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-// Tool 7: Get values
-server.registerTool(
-  "get_values",
-  {
-    description: `Get detailed information for multiple values/functions in a single call.
-
-WHAT YOU GET:
-- results: Array of lookup results for each requested value
-- Each result shows success/failure, signature, parameter count, and return type
-- Supports alias resolution and global values
-- Returns partial results if some lookups fail
-
-HOW TO USE:
-- Use fully qualified names like 'WebAPI.Clipboard.writeText'
-- Use global values like 'console.log' (no module prefix)
-- Check success field to see if lookup worked
-- Use signature to understand function parameters and return type
-
-EXAMPLES:
-- Find clipboard API: ['Clipboard-WebAPI.writeText']
-- Find React hooks: ['React.useEffect', 'React.useState']
-- Find DOM functions: ['Element-WebAPI.querySelectorAll']
-
-WHEN TO USE:
-✅ Use this for getting exact function signatures and parameter counts
-✅ Use this to understand return types and function arity
-✅ Use this for discovering available functions in modules
-❌ Don't use this for finding code patterns or usage examples (use grep instead)
-
-BAD EXAMPLES TO AVOID:
-❌ Searching for "async component" - MCP tools can't find code patterns
-❌ Looking for "dict{" usage - MCP tools can't find syntax patterns
-❌ Finding "let make = async" - MCP tools can't find code examples
-❌ Searching for "Response.json" usage - MCP tools can't find implementation details
-❌ Looking for "try/catch" patterns - MCP tools can't find code snippets
-
-Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds.`,
-    inputSchema: {
-      projectRoot: z
-        .string()
-        .describe(
-          "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
-        ),
-      valueNames: z
-        .array(z.string())
-        .describe(
-          "Array of fully qualified value names. Examples: 'React.useState', 'Array.map', 'console.log' (global values)",
-        ),
-    },
-    outputSchema: {
-      results: z.array(
-        z.object({
-          valueName: z.string(),
-          success: z.boolean(),
-          value: z.any().optional(),
-          error: z.string().optional(),
-        }),
-      ),
-    },
-  },
-  async ({ projectRoot, valueNames }) => {
-    if (!valueNames || !Array.isArray(valueNames)) {
-      throw new Error("valueNames must be a non-empty array");
-    }
-
-    try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-      const results = [];
-
-      for (const valueName of valueNames) {
-        try {
-          // Parse the fully qualified value name
-          const parts = valueName.split(".");
-          let qualifiedModuleName, actualValueName;
-
-          if (parts.length === 1) {
-            // Global value (e.g., "console", "window")
-            qualifiedModuleName = "";
-            actualValueName = parts[0];
-          } else {
-            // Module value (e.g., "React.useState", "Array.map")
-            actualValueName = parts.pop();
-            qualifiedModuleName = parts.join(".");
-          }
-
-          const result = await getValueDetails(
-            db,
-            qualifiedModuleName,
-            actualValueName,
-          );
-          results.push({
-            valueName,
-            ...result,
-          });
-        } catch (error) {
-          results.push({
-            valueName,
-            success: false,
-            error: `Error processing request: ${error.message}`,
-          });
-        }
-      }
-
-      db.close();
-
-      return {
-        content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }],
-        structuredContent: { results },
-      };
-    } catch (ex) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${ex.message}\n\nAttempted projectRoot: ${projectRoot || "not provided"}\n\nSuggestion: Check that projectRoot points to a directory with rescript.json`,
-          },
-        ],
-        isError: true,
-      };
-    }
-  },
-);
-
-// Tool 8: Search codebase
-server.registerTool(
-  "search_rescript_codebase",
-  {
-    description: `Search across all ReScript packages, modules, types, and values with a single query.
-
-WHAT YOU GET:
-- Unified search results across all packages
-- Categorized results (types, values, modules, packages)
-- Direct pointers to specific tools for detailed exploration
-- Search suggestions and related matches
-
-HOW TO USE THE RESULTS:
-- Use 'category' to understand what type of result it is
-- Use 'qualifiedName' for direct tool calls (get_rescript_module_info, get_values, etc.)
-- Use 'packageName' to explore the package further
-- Use 'suggestions' to refine your search
-
-EXAMPLES:
-- Search 'clipboard' → finds Clipboard-WebAPI module, writeText function, clipboard type
-- Search 'useState' → finds React.useState hook
-- Search 'querySelector' → finds Element-WebAPI.querySelectorAll function
-- Search 'fetch' → finds FetchAPI-WebAPI module, fetch function
-
-WORKFLOW:
-1. Use this tool for initial discovery
-2. Use suggested follow-up tools for detailed exploration
-3. Use qualifiedName results for specific lookups
-
-WHEN TO USE:
-✅ Use this for discovering available symbols (functions, types, modules)
-✅ Use this to find the right module/function before getting detailed info
-✅ Use this for exploring the codebase structure
-❌ Don't use this for finding code patterns or usage examples (use grep instead)
-
-BAD EXAMPLES TO AVOID:
-❌ Searching for "async component" - MCP tools can't find code patterns
-❌ Looking for "dict{" usage - MCP tools can't find syntax patterns
-❌ Finding "let make = async" - MCP tools can't find code examples
-❌ Searching for "JSON.Object" usage - MCP tools can't find implementation details
-❌ Looking for "try/catch" patterns - MCP tools can't find code snippets
-❌ Finding "React.use" patterns - MCP tools can't find code examples
-
-Note: This tool requires being called from within a ReScript project directory (with rescript.json). The first call will automatically compile and index the project, which may take 10-30 seconds.`,
-    inputSchema: {
-      projectRoot: z
-        .string()
-        .describe(
-          "Absolute path to ReScript workspace root (directory containing top-level rescript.json). Required.",
-        ),
-      searchTerm: z
-        .string()
-        .describe(
-          "Search term to find across all packages, modules, types, and values",
-        ),
-      categories: z
-        .array(z.enum(["packages", "modules", "types", "values", "all"]))
-        .optional()
-        .describe("Filter results by category (default: ['all'])"),
-      maxResults: z
-        .number()
-        .optional()
-        .describe("Maximum number of results to return (default: 50)"),
-    },
-    outputSchema: {
-      searchTerm: z.string().describe("The search term that was used"),
-      totalResults: z.number().describe("Total number of matches found"),
       results: z
-        .array(
-          z.object({
-            category: z
-              .enum(["package", "module", "type", "value"])
-              .describe("What type of result this is"),
-            name: z.string().describe("The name of the found item"),
-            qualifiedName: z
-              .string()
-              .describe("Full qualified name for direct tool calls"),
-            packageName: z.string().describe("Package this result belongs to"),
-            signature: z
-              .string()
-              .optional()
-              .describe("Function/type signature if available"),
-            description: z
-              .string()
-              .optional()
-              .describe("Brief description of what this is"),
-            matchScore: z
-              .number()
-              .describe("Relevance score for ranking (higher is better)"),
-          }),
-        )
-        .describe("Search results categorized by type"),
-      suggestions: z
-        .array(z.string())
-        .describe("Suggested follow-up tool calls based on results found"),
+        .array(z.any())
+        .describe("Query results as array of row objects"),
     },
   },
-  async ({
-    projectRoot,
-    searchTerm,
-    categories = ["all"],
-    maxResults = 50,
-  }) => {
-    if (!searchTerm) {
-      throw new Error("searchTerm is required");
+  async ({ projectRoot, sql }) => {
+    if (!sql) {
+      throw new Error("sql parameter is required");
+    }
+
+    // Validate SQL - only allow SELECT statements
+    const sqlUpper = sql.trim().toUpperCase();
+    const forbiddenKeywords = [
+      "INSERT",
+      "UPDATE",
+      "DELETE",
+      "DROP",
+      "ALTER",
+      "CREATE",
+      "TRUNCATE",
+      "REPLACE",
+    ];
+
+    for (const keyword of forbiddenKeywords) {
+      if (sqlUpper.includes(keyword)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: SQL query contains forbidden keyword '${keyword}'. Only SELECT queries are allowed for security.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    if (!sqlUpper.startsWith("SELECT")) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: Only SELECT queries are allowed. Query must start with SELECT.",
+          },
+        ],
+        isError: true,
+      };
     }
 
     try {
-      const db = await ensureDatabaseInitialized(projectRoot);
-      const searchResults = await searchCodebase(
-        db,
-        searchTerm,
-        categories,
-        maxResults,
-      );
-      db.close();
+      const dbPath = await getDbPath(projectRoot);
+      const db = new Database(dbPath, { readonly: true });
 
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(searchResults, null, 2) },
-        ],
-        structuredContent: searchResults,
-      };
+      try {
+        const results = db.query(sql).all();
+        db.close();
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(results, null, 2),
+            },
+          ],
+          structuredContent: {
+            results,
+          },
+        };
+      } catch (queryError) {
+        db.close();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `SQL Error: ${queryError.message}\n\nQuery: ${sql}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     } catch (ex) {
       return {
         content: [
@@ -3100,8 +2143,6 @@ async function startMcpServer() {
   console.error("ReScript MCP Server running on stdio");
 }
 
-import { parseArgs } from "node:util";
-
 const { values } = parseArgs({
   args: Bun.argv,
   options: {
@@ -3112,71 +2153,6 @@ const { values } = parseArgs({
     sync: {
       type: "boolean",
       description: "Sync the ReScript database with current project",
-    },
-    "test-query": {
-      type: "string",
-      description: "Test querying a package",
-    },
-    "test-module": {
-      type: "string",
-      description: "Test querying a specific module",
-    },
-    "test-module-search-term": {
-      type: "string",
-      description: "Optional search term for filtering within the module",
-    },
-    "test-module-search-type": {
-      type: "string",
-      description:
-        "Search type for test-module: types, values, nested-modules, aliases, or all (default: all)",
-    },
-    "test-global-symbols": {
-      type: "boolean",
-      description: "Test querying global symbols",
-    },
-    "test-global-symbols-package": {
-      type: "string",
-      description:
-        "Package name to filter global symbols (use with --test-global-symbols)",
-    },
-    "test-type-usage": {
-      type: "string",
-      description:
-        "Test where a type is used across all modules (format: ModuleName.TypeName or TypeName for global types)",
-    },
-    "test-type-usage-filter": {
-      type: "string",
-      description:
-        "Optional filter for test-type-usage results (case-insensitive)",
-    },
-    "test-generic-parse": {
-      type: "string",
-      description: "Test the generic type parser with a signature string",
-    },
-    "test-type": {
-      type: "string",
-      multiple: true,
-      description:
-        "Test type query (fully qualified type name). Can be used multiple times.",
-    },
-    "test-value": {
-      type: "string",
-      multiple: true,
-      description:
-        "Test value query (fully qualified value name). Can be used multiple times.",
-    },
-    "test-search": {
-      type: "string",
-      description: "Test the search_rescript_codebase tool",
-    },
-    "test-search-category": {
-      type: "string",
-      description:
-        "Optional category filter for search (packages, modules, types, values, all)",
-    },
-    "test-search-max": {
-      type: "string",
-      description: "Optional max results for search (default: 50)",
     },
   },
   strict: true,
@@ -3202,1003 +2178,17 @@ if (values.stdio) {
     console.error(`Error: ${error.message}`);
     process.exit(1);
   }
-} else if (values["test-query"]) {
-  try {
-    const projectRoot = process.cwd();
-    const dbPath = await getDbPath(projectRoot);
-    const db = new Database(dbPath, { readonly: true });
-
-    console.log("\n=== Packages ===");
-    const packages = db
-      .query("SELECT name, path FROM packages ORDER BY name")
-      .all();
-    console.table(packages);
-
-    if (values["test-query"] !== "all") {
-      const pkg = db
-        .query("SELECT id FROM packages WHERE name = ?")
-        .get(values["test-query"]);
-
-      if (pkg) {
-        console.log(`\n=== Top-level Modules in ${values["test-query"]} ===`);
-        const modules = db
-          .query(
-            `
-        SELECT qualified_name, source_file_path 
-        FROM modules 
-        WHERE package_id = ? AND parent_module_id IS NULL
-        ORDER BY qualified_name
-      `,
-          )
-          .all(pkg.id);
-        console.table(modules);
-
-        if (modules.length > 0) {
-          const firstModule = modules[0].qualified_name;
-          const module = db
-            .query(
-              `
-          SELECT id, qualified_name, source_file_path 
-          FROM modules 
-          WHERE qualified_name = ?
-        `,
-            )
-            .get(firstModule);
-
-          if (module) {
-            console.log(`\n=== Sample Module: ${firstModule} ===`);
-            console.log(`Source: ${module.source_file_path}`);
-
-            const nestedModules = db
-              .query(
-                `
-            SELECT qualified_name 
-            FROM modules 
-            WHERE parent_module_id = ?
-            ORDER BY qualified_name
-          `,
-              )
-              .all(module.id);
-            if (nestedModules.length > 0) {
-              console.log(
-                `\nNested modules (showing ${nestedModules.length}):`,
-              );
-              console.table(nestedModules);
-            }
-
-            const types = db
-              .query(
-                `
-            SELECT name, kind, signature 
-            FROM types 
-            WHERE module_id = ?
-            ORDER BY name
-          `,
-              )
-              .all(module.id);
-            if (types.length > 0) {
-              console.log(`\nTypes (showing ${types.length}):`);
-              console.table(types);
-            }
-
-            const values = db
-              .query(
-                `
-            SELECT name, param_count, signature 
-            FROM "values" 
-            WHERE module_id = ?
-            ORDER BY name
-          `,
-              )
-              .all(module.id);
-            if (values.length > 0) {
-              console.log(`\nValues (showing ${values.length}):`);
-              console.table(values);
-            }
-          }
-        }
-      } else {
-        console.log(`\nPackage "${values["test-query"]}" not found.`);
-      }
-    }
-
-    db.close();
-  } catch (error) {
-    console.error(
-      `Test command must be run from a ReScript project root (with rescript.json)`,
-    );
-    console.error(`Error: ${error.message}`);
-    process.exit(1);
-  }
-} else if (values["test-module"]) {
-  try {
-    const projectRoot = process.cwd();
-    const dbPath = await getDbPath(projectRoot);
-    const db = new Database(dbPath, { readonly: true });
-    const moduleName = values["test-module"];
-    const searchTerm = values["test-module-search-term"];
-    const searchType = values["test-module-search-type"] || "all";
-
-    if (!moduleName) {
-      console.log(
-        '\nUsage: --test-module "ModuleName" [--test-module-search-term <term>] [--test-module-search-type <type>]',
-      );
-      console.log('Example: --test-module "Iluvatar"');
-      console.log(
-        'Example: --test-module "FetchAPI-WebAPI" --test-module-search-term "response"',
-      );
-      console.log(
-        'Example: --test-module "FetchAPI-WebAPI" --test-module-search-term "response" --test-module-search-type "types"',
-      );
-      console.log(
-        "SearchType can be: types, values, nested-modules, or all (default: all)",
-      );
-      db.close();
-    } else {
-      // Try to resolve module with alias resolution
-      const { module: resolvedModule, resolvedFromAlias } = resolveModuleAlias(
-        db,
-        moduleName,
-      );
-
-      if (!resolvedModule) {
-        console.log(`\nModule "${moduleName}" not found.`);
-        db.close();
-      } else {
-        const module = db
-          .query(
-            `
-        SELECT m.id, m.qualified_name, m.source_file_path, p.name as package_name
-        FROM modules m
-        JOIN packages p ON m.package_id = p.id
-        WHERE m.qualified_name = ?
-      `,
-          )
-          .get(resolvedModule.qualified_name);
-
-        if (!module) {
-          console.log(`\nModule "${moduleName}" not found.`);
-          db.close();
-        } else {
-          if (searchTerm) {
-            console.log(
-              `\n=== Search Results in Module: ${module.qualified_name} ===`,
-            );
-            console.log(`Package: ${module.package_name}`);
-            console.log(`Source: ${module.source_file_path}`);
-            if (resolvedFromAlias) {
-              console.log(`Resolved from alias: ${resolvedFromAlias}`);
-            }
-            console.log(`Search Term: "${searchTerm}"`);
-            console.log(`Search Type: "${searchType}"`);
-          } else {
-            console.log(`\n=== Module: ${module.qualified_name} ===`);
-            console.log(`Package: ${module.package_name}`);
-            console.log(`Source: ${module.source_file_path}`);
-            if (resolvedFromAlias) {
-              console.log(`Resolved from alias: ${resolvedFromAlias}`);
-            }
-          }
-
-          // Determine search behavior
-          const hasSearch = searchTerm && searchTerm.trim() !== "";
-          const effectiveSearchType =
-            hasSearch && !searchType ? "all" : searchType;
-          const searchPattern = hasSearch ? `%${searchTerm}%` : null;
-
-          // Get nested modules
-          let nestedModulesQuery = `
-        SELECT qualified_name 
-        FROM modules 
-        WHERE parent_module_id = ? 
-      `;
-          let nestedModulesParams = [module.id];
-
-          if (
-            hasSearch &&
-            (effectiveSearchType === "all" ||
-              effectiveSearchType === "nested-modules")
-          ) {
-            nestedModulesQuery += ` AND LOWER(qualified_name) LIKE LOWER(?)`;
-            nestedModulesParams.push(searchPattern);
-          }
-
-          nestedModulesQuery += ` ORDER BY qualified_name`;
-
-          const nestedModules = db
-            .query(nestedModulesQuery)
-            .all(...nestedModulesParams);
-          if (
-            effectiveSearchType === "all" ||
-            effectiveSearchType === "nested-modules"
-          ) {
-            if (nestedModules.length > 0) {
-              console.log(`\n--- Nested Modules (${nestedModules.length}) ---`);
-              console.table(nestedModules);
-            } else {
-              console.log(`\n--- Nested Modules (0 matches) ---`);
-            }
-          }
-
-          // Get types
-          let typesQuery = `
-        SELECT name, kind, signature
-        FROM types
-        WHERE module_id = ?
-      `;
-          let typesParams = [module.id];
-
-          if (
-            hasSearch &&
-            (effectiveSearchType === "all" || effectiveSearchType === "types")
-          ) {
-            typesQuery += ` AND LOWER(name) LIKE LOWER(?)`;
-            typesParams.push(searchPattern);
-          }
-
-          typesQuery += ` ORDER BY name`;
-
-          const types = db.query(typesQuery).all(...typesParams);
-          if (
-            effectiveSearchType === "all" ||
-            effectiveSearchType === "types"
-          ) {
-            if (types.length > 0) {
-              console.log(`\n--- Types (${types.length}) ---`);
-              console.table(types);
-            } else {
-              console.log(`\n--- Types (0 matches) ---`);
-            }
-          }
-
-          // Get values
-          let valuesQuery = `
-        SELECT name, param_count, signature
-        FROM "values"
-        WHERE module_id = ?
-      `;
-          let valuesParams = [module.id];
-
-          if (
-            hasSearch &&
-            (effectiveSearchType === "all" || effectiveSearchType === "values")
-          ) {
-            valuesQuery += ` AND LOWER(name) LIKE LOWER(?)`;
-            valuesParams.push(searchPattern);
-          }
-
-          valuesQuery += ` ORDER BY name`;
-
-          const values = db.query(valuesQuery).all(...valuesParams);
-          if (
-            effectiveSearchType === "all" ||
-            effectiveSearchType === "values"
-          ) {
-            if (values.length > 0) {
-              console.log(`\n--- Values (${values.length}) ---`);
-              console.table(values);
-            } else {
-              console.log(`\n--- Values (0 matches) ---`);
-            }
-          }
-
-          // Get aliases
-          let aliasesQuery = `
-        SELECT alias_name, alias_kind, target_qualified_name
-        FROM aliases
-        WHERE source_module_id = ?
-      `;
-          let aliasesParams = [module.id];
-
-          if (
-            hasSearch &&
-            (effectiveSearchType === "all" || effectiveSearchType === "aliases")
-          ) {
-            aliasesQuery += ` AND LOWER(alias_name) LIKE LOWER(?)`;
-            aliasesParams.push(searchPattern);
-          }
-
-          aliasesQuery += ` ORDER BY alias_name`;
-
-          const aliases = db.query(aliasesQuery).all(...aliasesParams);
-          if (
-            effectiveSearchType === "all" ||
-            effectiveSearchType === "aliases"
-          ) {
-            if (aliases.length > 0) {
-              console.log(`\n--- Aliases (${aliases.length}) ---`);
-              console.table(aliases);
-            } else {
-              console.log(`\n--- Aliases (0 matches) ---`);
-            }
-          }
-
-          db.close();
-        }
-      }
-    }
-  } catch (error) {
-    console.error(
-      `Test command must be run from a ReScript project root (with rescript.json)`,
-    );
-    console.error(`Error: ${error.message}`);
-    process.exit(1);
-  }
-} else if (values["test-global-symbols"]) {
-  try {
-    const projectRoot = process.cwd();
-    const dbPath = await getDbPath(projectRoot);
-    const db = new Database(dbPath, { readonly: true });
-    const packageName = values["test-global-symbols-package"];
-
-    // Get all auto-opened modules
-    let query = `
-    SELECT m.qualified_name, m.is_auto_opened, p.name as package_name
-    FROM modules m
-    JOIN packages p ON m.package_id = p.id
-    WHERE m.is_auto_opened = 1 AND m.parent_module_id IS NULL
-  `;
-    let params = [];
-
-    if (packageName && packageName !== "all") {
-      query += ` AND p.name = ?`;
-      params.push(packageName);
-    }
-
-    query += ` ORDER BY p.name, m.qualified_name`;
-
-    const autoOpenedModules = db.query(query).all(...params);
-
-    if (autoOpenedModules.length === 0) {
-      console.log(
-        `\nNo auto-opened modules found${packageName && packageName !== "all" ? ` for package "${packageName}"` : ""}.`,
-      );
-      db.close();
-    } else {
-      console.log(
-        `\n=== Global Symbols${packageName && packageName !== "all" ? ` (${packageName})` : ""} ===`,
-      );
-      console.log(`Found ${autoOpenedModules.length} auto-opened module(s):\n`);
-
-      for (const module of autoOpenedModules) {
-        console.log(
-          `--- ${module.qualified_name} (${module.package_name}) ---`,
-        );
-
-        // Get types for this module
-        const types = db
-          .query(
-            `
-        SELECT name, kind, signature 
-        FROM types 
-        WHERE module_id = (SELECT id FROM modules WHERE qualified_name = ?)
-        ORDER BY name
-      `,
-          )
-          .all(module.qualified_name);
-
-        if (types.length > 0) {
-          console.log(`\nTypes (showing ${types.length}):`);
-          console.table(types);
-        }
-
-        // Get values for this module
-        const values = db
-          .query(
-            `
-        SELECT name, signature, param_count 
-        FROM "values" 
-        WHERE module_id = (SELECT id FROM modules WHERE qualified_name = ?)
-        ORDER BY name
-      `,
-          )
-          .all(module.qualified_name);
-
-        if (values.length > 0) {
-          console.log(`\nValues (showing ${values.length}):`);
-          console.table(values);
-        }
-
-        // Get aliases for this module
-        const aliases = db
-          .query(
-            `
-        SELECT alias_name, alias_kind, target_qualified_name 
-        FROM aliases 
-        WHERE source_module_id = (SELECT id FROM modules WHERE qualified_name = ?)
-        ORDER BY alias_name
-      `,
-          )
-          .all(module.qualified_name);
-
-        if (aliases.length > 0) {
-          console.log(`\nAliases (showing ${aliases.length}):`);
-          console.table(aliases);
-        }
-
-        console.log(""); // Empty line between modules
-      }
-
-      db.close();
-    }
-  } catch (error) {
-    console.error(
-      `Test command must be run from a ReScript project root (with rescript.json)`,
-    );
-    console.error(`Error: ${error.message}`);
-    process.exit(1);
-  }
-} else if (values["test-type-usage"]) {
-  try {
-    const projectRoot = process.cwd();
-    const dbPath = await getDbPath(projectRoot);
-    const db = new Database(dbPath, { readonly: true });
-    const input = values["test-type-usage"];
-    const filter = values["test-type-usage-filter"];
-
-    // Parse the input to handle both "ModuleName.TypeName" and "TypeName" (global type) formats
-    let moduleName, typeName;
-    if (input.includes(".")) {
-      // Format: ModuleName.TypeName
-      [moduleName, typeName] = input.split(".");
-    } else {
-      // Format: TypeName (global type)
-      moduleName = "";
-      typeName = input;
-    }
-
-    if (!typeName) {
-      console.log(
-        '\nUsage: --test-type-usage "ModuleName.TypeName" or --test-type-usage "TypeName"',
-      );
-      console.log('Example: --test-type-usage "String.t" (module type)');
-      console.log('Example: --test-type-usage "string" (global type)');
-      db.close();
-    } else {
-      let resolvedModule, resolvedFromAlias;
-
-      if (moduleName === "") {
-        // Global type - stored in Pervasives module
-        resolvedModule = db
-          .query(
-            "SELECT id, qualified_name FROM modules WHERE qualified_name = 'Pervasives'",
-          )
-          .get();
-        resolvedFromAlias = null;
-      } else {
-        // Try to resolve module with alias resolution
-        const result = resolveModuleAlias(db, moduleName);
-        resolvedModule = result.module;
-        resolvedFromAlias = result.resolvedFromAlias;
-      }
-
-      if (!resolvedModule) {
-        const moduleDisplayName = moduleName || "global";
-        console.log(
-          `\nType "${typeName}" not found in ${moduleDisplayName === "global" ? "global scope" : `module "${moduleName}"`}.`,
-        );
-        db.close();
-      } else {
-        const displayName =
-          moduleName === ""
-            ? typeName
-            : `${resolvedModule.qualified_name}.${typeName}`;
-        console.log(`\n=== Type Usage: ${displayName} ===`);
-        if (resolvedFromAlias) {
-          console.log(`Resolved from alias: ${resolvedFromAlias}`);
-        }
-
-        // Find all type references for this type
-        const typeReferences = db
-          .query(
-            `
-        SELECT 
-          tr.context,
-          tr.position,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN t.name
-            WHEN tr.source_value_id IS NOT NULL THEN v.name
-            ELSE NULL
-          END as source_name,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN tm.qualified_name
-            WHEN tr.source_value_id IS NOT NULL THEN vm.qualified_name
-            ELSE NULL
-          END as source_module,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN 'type'
-            WHEN tr.source_value_id IS NOT NULL THEN 'value'
-            ELSE 'unknown'
-          END as source_kind,
-          CASE 
-            WHEN tr.source_type_id IS NOT NULL THEN t.signature
-            WHEN tr.source_value_id IS NOT NULL THEN v.signature
-            ELSE NULL
-          END as source_signature
-        FROM type_references tr
-        LEFT JOIN types t ON tr.source_type_id = t.id
-        LEFT JOIN modules tm ON t.module_id = tm.id
-        LEFT JOIN "values" v ON tr.source_value_id = v.id
-        LEFT JOIN modules vm ON v.module_id = vm.id
-        WHERE (tr.referenced_type_name = ? AND tr.referenced_module_name = ?) 
-           OR (tr.referenced_type_name = ? AND (tr.referenced_module_name = '' OR tr.referenced_module_name IS NULL) AND vm.qualified_name = ?)
-        ORDER BY source_module, source_name, tr.context
-      `,
-          )
-          .all(
-            typeName,
-            resolvedModule.qualified_name,
-            typeName,
-            resolvedModule.qualified_name,
-          );
-
-        // Find all generic parameters that use this type
-        const genericParameters = db
-          .query(
-            `
-        SELECT 
-          gtp.parameter_signature,
-          gtp.base_type,
-          gtp.field_name,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN t.name
-            WHEN gtp.value_id IS NOT NULL THEN v.name
-            ELSE NULL
-          END as source_name,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN tm.qualified_name
-            WHEN gtp.value_id IS NOT NULL THEN vm.qualified_name
-            ELSE NULL
-          END as source_module,
-          CASE 
-            WHEN gtp.type_id IS NOT NULL THEN 'type'
-            WHEN gtp.value_id IS NOT NULL THEN 'value'
-            ELSE 'unknown'
-          END as source_kind
-        FROM generic_type_parameters gtp
-        LEFT JOIN types t ON gtp.type_id = t.id
-        LEFT JOIN modules tm ON t.module_id = tm.id
-        LEFT JOIN "values" v ON gtp.value_id = v.id
-        LEFT JOIN modules vm ON v.module_id = vm.id
-        WHERE gtp.parameter_signature = ? OR gtp.parameter_signature = ? OR gtp.parameter_signature LIKE ? OR gtp.parameter_signature LIKE ?
-        ORDER BY source_module, source_name, gtp.parameter_signature
-      `,
-          )
-          .all(
-            typeName, // Exact match for global types
-            `${resolvedModule.qualified_name}.${typeName}`, // Exact match for qualified types
-            `%<${typeName}>%`, // Generic parameter like Type<React.element>
-            `%<${resolvedModule.qualified_name}.${typeName}>%`, // Generic parameter like Type<Module.Type>
-          );
-
-        // Organize results
-        const usedInTypes = [];
-        const usedInValues = [];
-        const usedAsGenericParameter = [];
-
-        for (const ref of typeReferences) {
-          if (ref.source_kind === "type") {
-            usedInTypes.push({
-              module: ref.source_module,
-              type: ref.source_name,
-              context: ref.context,
-              signature: ref.source_signature,
-            });
-          } else if (ref.source_kind === "value") {
-            usedInValues.push({
-              module: ref.source_module,
-              value: ref.source_name,
-              context: ref.context,
-              signature: ref.source_signature,
-            });
-          }
-        }
-
-        for (const param of genericParameters) {
-          usedAsGenericParameter.push({
-            module: param.source_module,
-            type: param.source_kind === "type" ? param.source_name : undefined,
-            value:
-              param.source_kind === "value" ? param.source_name : undefined,
-            field: param.field_name === null ? undefined : param.field_name,
-            signature: param.parameter_signature,
-            baseType: param.base_type,
-          });
-        }
-
-        // Apply filtering if provided
-        const filterLower = filter ? filter.toLowerCase() : null;
-        const filterResults = (items) => {
-          if (!filterLower) return items;
-          return items.filter((item) => {
-            return (
-              item.module?.toLowerCase().includes(filterLower) ||
-              item.type?.toLowerCase().includes(filterLower) ||
-              item.value?.toLowerCase().includes(filterLower) ||
-              item.field?.toLowerCase().includes(filterLower) ||
-              item.context?.toLowerCase().includes(filterLower) ||
-              item.signature?.toLowerCase().includes(filterLower) ||
-              item.baseType?.toLowerCase().includes(filterLower)
-            );
-          });
-        };
-
-        const filteredUsedInTypes = filterResults(usedInTypes);
-        const filteredUsedInValues = filterResults(usedInValues);
-        const filteredUsedAsGenericParameter = filterResults(
-          usedAsGenericParameter,
-        );
-
-        if (filter) {
-          console.log(`\nFilter applied: "${filter}" (case-insensitive)`);
-          console.log(
-            `Results: ${filteredUsedInTypes.length} types, ${filteredUsedInValues.length} values, ${filteredUsedAsGenericParameter.length} generic parameters`,
-          );
-        }
-
-        console.log(`\nUsed in Types (${filteredUsedInTypes.length}):`);
-        if (filteredUsedInTypes.length > 0) {
-          console.table(filteredUsedInTypes);
-        } else {
-          console.log("  None found");
-        }
-
-        console.log(`\nUsed in Values (${filteredUsedInValues.length}):`);
-        if (filteredUsedInValues.length > 0) {
-          console.table(filteredUsedInValues);
-        } else {
-          console.log("  None found");
-        }
-
-        console.log(
-          `\nUsed as Generic Parameter (${filteredUsedAsGenericParameter.length}):`,
-        );
-        if (filteredUsedAsGenericParameter.length > 0) {
-          console.table(filteredUsedAsGenericParameter);
-        } else {
-          console.log("  None found");
-        }
-
-        db.close();
-      }
-    }
-  } catch (error) {
-    console.error(
-      `Test command must be run from a ReScript project root (with rescript.json)`,
-    );
-    console.error(`Error: ${error.message}`);
-    process.exit(1);
-  }
-} else if (values["test-generic-parse"]) {
-  const signature = values["test-generic-parse"];
-
-  console.log(`\n=== Generic Type Parser Test ===`);
-  console.log(`Input signature: ${signature}`);
-
-  try {
-    const result = parseTypeSignature(signature, "test");
-
-    console.log(`\nType References (${result.typeReferences.length}):`);
-    if (result.typeReferences.length > 0) {
-      console.table(result.typeReferences);
-    } else {
-      console.log("  None found");
-    }
-
-    console.log(`\nGeneric Parameters (${result.genericParameters.length}):`);
-    if (result.genericParameters.length > 0) {
-      console.table(result.genericParameters);
-    } else {
-      console.log("  None found");
-    }
-  } catch (ex) {
-    console.log(`\nError parsing signature: ${ex.message}`);
-  }
-} else if (values["test-type"]) {
-  const typeNames = values["test-type"];
-
-  if (!typeNames || typeNames.length === 0) {
-    console.log(
-      "\nUsage: --test-type <typeName> [--test-type <typeName2> ...]",
-    );
-    console.log(
-      'Example: --test-type string --test-type "Array.t" --test-type "React.element"',
-    );
-  } else {
-    console.log(`\n=== Type Lookup (${typeNames.length} requests) ===`);
-
-    // Simulate the MCP tool call
-    try {
-      const projectRoot = process.cwd();
-      const dbPath = await getDbPath(projectRoot);
-      const db = new Database(dbPath, { readonly: true });
-      const results = [];
-
-      for (const typeName of typeNames) {
-        try {
-          // Parse the fully qualified type name
-          const parts = typeName.split(".");
-          let qualifiedModuleName, actualTypeName;
-
-          if (parts.length === 1) {
-            // Global type (e.g., "string", "int")
-            qualifiedModuleName = "";
-            actualTypeName = parts[0];
-          } else {
-            // Module type (e.g., "React.element", "Array.t")
-            actualTypeName = parts.pop();
-            qualifiedModuleName = parts.join(".");
-          }
-
-          const result = await getTypeDetails(
-            db,
-            qualifiedModuleName,
-            actualTypeName,
-          );
-          results.push({
-            typeName,
-            ...result,
-          });
-        } catch (error) {
-          results.push({
-            typeName,
-            success: false,
-            error: `Error processing request: ${error.message}`,
-          });
-        }
-      }
-
-      db.close();
-
-      // Display results
-      const successful = results.filter((r) => r.success);
-      const failed = results.filter((r) => !r.success);
-
-      console.log(
-        `\nResults: ${successful.length} successful, ${failed.length} failed\n`,
-      );
-
-      if (successful.length > 0) {
-        console.log("--- Successful Lookups ---");
-        for (const result of successful) {
-          console.log(`\n✅ ${result.typeName}`);
-          if (result.type.resolvedFromAlias) {
-            console.log(
-              `   Resolved from alias: ${result.type.resolvedFromAlias}`,
-            );
-          }
-          console.log(`   Kind: ${result.type.kind}`);
-          if (result.type.signature) {
-            console.log(`   Signature: ${result.type.signature}`);
-          }
-          if (result.type.usageHint) {
-            console.log(`   Usage Hint: ${result.type.usageHint}`);
-          }
-        }
-      }
-
-      if (failed.length > 0) {
-        console.log("\n--- Failed Lookups ---");
-        for (const result of failed) {
-          console.log(`\n❌ ${result.typeName}`);
-          console.log(`   Error: ${result.error}`);
-        }
-      }
-    } catch (error) {
-      console.error(
-        `Test command must be run from a ReScript project root (with rescript.json)`,
-      );
-      console.error(`Error: ${error.message}`);
-      process.exit(1);
-    }
-  }
-} else if (values["test-value"]) {
-  const valueNames = values["test-value"];
-
-  if (!valueNames || valueNames.length === 0) {
-    console.log(
-      "\nUsage: --test-value <valueName> [--test-value <valueName2> ...]",
-    );
-    console.log(
-      'Example: --test-value "+" --test-value "Array.map" --test-value "React.useState"',
-    );
-  } else {
-    console.log(`\n=== Value Lookup (${valueNames.length} requests) ===`);
-
-    // Simulate the MCP tool call
-    try {
-      const projectRoot = process.cwd();
-      const dbPath = await getDbPath(projectRoot);
-      const db = new Database(dbPath, { readonly: true });
-      const results = [];
-
-      for (const valueName of valueNames) {
-        try {
-          // Parse the fully qualified value name
-          const parts = valueName.split(".");
-          let qualifiedModuleName, actualValueName;
-
-          if (parts.length === 1) {
-            // Global value (e.g., "console", "window")
-            qualifiedModuleName = "";
-            actualValueName = parts[0];
-          } else {
-            // Module value (e.g., "React.useState", "Array.map")
-            actualValueName = parts.pop();
-            qualifiedModuleName = parts.join(".");
-          }
-
-          const result = await getValueDetails(
-            db,
-            qualifiedModuleName,
-            actualValueName,
-          );
-          results.push({
-            valueName,
-            ...result,
-          });
-        } catch (error) {
-          results.push({
-            valueName,
-            success: false,
-            error: `Error processing request: ${error.message}`,
-          });
-        }
-      }
-
-      db.close();
-
-      // Display results
-      const successful = results.filter((r) => r.success);
-      const failed = results.filter((r) => !r.success);
-
-      console.log(
-        `\nResults: ${successful.length} successful, ${failed.length} failed\n`,
-      );
-
-      if (successful.length > 0) {
-        console.log("--- Successful Lookups ---");
-        for (const result of successful) {
-          console.log(`\n✅ ${result.valueName}`);
-          if (result.value.resolvedFromAlias) {
-            console.log(
-              `   Resolved from alias: ${result.value.resolvedFromAlias}`,
-            );
-          }
-          console.log(`   Parameters: ${result.value.paramCount}`);
-          if (result.value.returnType) {
-            console.log(`   Return type: ${result.value.returnType}`);
-          }
-          if (result.value.signature) {
-            console.log(`   Signature: ${result.value.signature}`);
-          }
-        }
-      }
-
-      if (failed.length > 0) {
-        console.log("\n--- Failed Lookups ---");
-        for (const result of failed) {
-          console.log(`\n❌ ${result.valueName}`);
-          console.log(`   Error: ${result.error}`);
-        }
-      }
-    } catch (error) {
-      console.error(
-        `Test command must be run from a ReScript project root (with rescript.json)`,
-      );
-      console.error(`Error: ${error.message}`);
-      process.exit(1);
-    }
-  }
-} else if (values["test-search"]) {
-  const searchTerm = values["test-search"];
-  const category = values["test-search-category"];
-  const maxResults = values["test-search-max"]
-    ? parseInt(values["test-search-max"], 10)
-    : 50;
-
-  if (!searchTerm) {
-    console.log(
-      '\nUsage: --test-search "searchTerm" [--test-search-category <category>] [--test-search-max <max>]',
-    );
-    console.log('Example: --test-search "useState"');
-    console.log(
-      'Example: --test-search "element" --test-search-category "types"',
-    );
-    console.log('Example: --test-search "clipboard" --test-search-max 10');
-    console.log(
-      "Categories: packages, modules, types, values, all (default: all)",
-    );
-  } else {
-    try {
-      const projectRoot = process.cwd();
-      const dbPath = await getDbPath(projectRoot);
-      const db = new Database(dbPath, { readonly: true });
-
-      const categories = category ? [category] : ["all"];
-      const searchResults = await searchCodebase(
-        db,
-        searchTerm,
-        categories,
-        maxResults,
-      );
-
-      console.log(`\n=== Search Results for "${searchTerm}" ===`);
-      if (category) {
-        console.log(`Category filter: ${category}`);
-      }
-      console.log(`Max results: ${maxResults}`);
-      console.log(`Total matches found: ${searchResults.totalResults}`);
-      console.log(`Results returned: ${searchResults.results.length}`);
-
-      if (searchResults.results.length > 0) {
-        console.log(`\n--- Search Results ---`);
-        console.table(
-          searchResults.results.map((r) => ({
-            category: r.category,
-            name: r.name,
-            qualifiedName: r.qualifiedName,
-            package: r.packageName,
-            matchScore: r.matchScore,
-            description: r.description,
-          })),
-        );
-
-        if (searchResults.suggestions.length > 0) {
-          console.log(`\n--- Suggestions ---`);
-          searchResults.suggestions.forEach((suggestion) => {
-            console.log(`  • ${suggestion}`);
-          });
-        }
-      } else {
-        console.log(`\nNo results found for "${searchTerm}"`);
-        console.log(`Try a broader search term or different categories`);
-      }
-
-      db.close();
-    } catch (error) {
-      console.error(
-        `Test command must be run from a ReScript project root (with rescript.json)`,
-      );
-      console.error(`Error: ${error.message}`);
-      process.exit(1);
-    }
-  }
 } else {
   console.log(`
 ReScript MCP Server
 
 Usage:
-  bun mcp.js --sync                    Sync the database with current ReScript projects
-  bun mcp.js --stdio                   Run the MCP server
-  bun mcp.js --test-query <pkg>        Test querying a package (or 'all' for package list)
-  bun mcp.js --test-module <module> [--test-module-search-term <term>] [--test-module-search-type <type>] Test querying a specific module
-  bun mcp.js --test-global-symbols [--test-global-symbols-package <package>] Test querying global symbols
-  bun mcp.js --test-type-usage <mod.type|type> [--test-type-usage-filter <filter>] Test where a type is used across all modules
-  bun mcp.js --test-generic-parse <signature> Test the generic type parser
-  bun mcp.js --test-type <typeName> [--test-type <typeName2> ...] Test type queries
-  bun mcp.js --test-value <valueName> [--test-value <valueName2> ...] Test value queries
-  bun mcp.js --test-search <term> [--test-search-category <category>] [--test-search-max <max>] Test the search tool
+  bun mcp/index.js --sync                    Sync the database with current ReScript projects
+  bun mcp/index.js --stdio                   Run the MCP server
+  bun start                                   Run the MCP server with inspector (via package.json script)
 
 Examples:
-  bun mcp.js --sync
-  bun mcp.js --test-query all
-  bun mcp.js --test-query ronnies.be
-  bun mcp.js --test-module Iluvatar
-  bun mcp.js --test-module "FetchAPI-WebAPI" --test-module-search-term "response"
-  bun mcp.js --test-module "FetchAPI-WebAPI" --test-module-search-term "response" --test-module-search-type "types"
-  bun mcp.js --test-module "Stdlib_Array" --test-module-search-term "map" --test-module-search-type "values"
-  bun mcp.js --test-global-symbols
-  bun mcp.js --test-global-symbols --test-global-symbols-package "ronnies.be"
-  bun mcp.js --test-type-usage "String.t"
-  bun mcp.js --test-type-usage "string"
-  bun mcp.js --test-type-usage "String.t" --test-type-usage-filter "Iluvatar"
-  bun mcp.js --test-type-usage "string" --test-type-usage-filter "Iluvatar"
-  bun mcp.js --test-generic-parse "Null.t<Option.t<string>>"
-  bun mcp.js --test-type string --test-type "Array.t" --test-type "React.element"
-  bun mcp.js --test-value "+" --test-value "Array.map" --test-value "React.useState"
-  bun mcp.js --test-search "useState"
-  bun mcp.js --test-search "element" --test-search-category "types"
-  bun mcp.js --test-search "clipboard" --test-search-max 10
-  `);
+  bun mcp/index.js --sync
+  bun start
+`);
 }
